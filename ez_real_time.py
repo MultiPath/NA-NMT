@@ -23,10 +23,12 @@ def try_model(args, model, sampler, train, dev):
         targets, target_masks, \
         sources, source_masks, \
         encoding, batch_size = model.quick_prepare(batch)
-        decoding = model(encoding, source_masks, inputs, input_masks)
 
-        print(encoding.size())
-        print(decoding.size())
-        print(sampler(encoding, decoding).size())
+        encoder_out = encoding[-1]
+        decoder_out = model(encoding, source_masks, inputs, input_masks)
+
+        print(encoder_out.size())
+        print(decoder_out.size())
+        print(sampler(encoder_out, decoder_out).size())
 
         break
