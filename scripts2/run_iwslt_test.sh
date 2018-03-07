@@ -9,7 +9,7 @@ python ez_run.py \
                 --use_wo \
                 --share_embeddings \
                 --realtime \
-                --pretrained_from "02.25_08.34.iwslt_subword_278_507_5_2_0.079_746_uni_.pt" \
+                --pretrained_from "02.25_08.34.iwslt_subword_278_507_5_2_0.079_746_uni_" \
                 --debug
                 #--params base-t2t \
                 #--fast --use_alignment --diag --positional_attention \
