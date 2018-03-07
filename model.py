@@ -985,6 +985,30 @@ class Transformer(nn.Module):
             loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
         return self.apply_mask_cost(loss, decoder_masks, batched)
 
+class GridSampler(nn.Module):
+
+    def __init__(self, d):
+        super().__init__()
+        self.w1 = Linear(d, 1, bias=False)
+        self.w2 = Linear(d, 1, bias=False)
+
+    def forward(self, x, y):
+        # x: batch * lx * d
+        # y: batch * ly * d
+        vx = self.w1(x).expand(x.size(0), x.size(1), y.size(1))
+        vy = self.w2(y).expand(y.size(0), y.size(1), x.size(1)).transpose(1, 2)
+        probs = F.sigmoid(vx + vy)
+        return probs
+
+
+class SimultaneousTransformer(Transformer):
+
+    def __init__(self, src, trg, args):
+        super(Transformer, self).__init__()
+        self.encoder = Encoder(src, args, causal=True)
+        self.decoder = Decoder(trg, args, causal=True)
+        self.field = trg
+
 
 class FastTransformer(Transformer):
 

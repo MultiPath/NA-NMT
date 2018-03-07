@@ -4,7 +4,7 @@ import math
 
 from torch.autograd import Variable
 from tqdm import tqdm, trange
-from model import Transformer, FastTransformer
+from model import Transformer, FastTransformer, SimultaneousTransformer
 from utils import Metrics, Best, computeGLEU, computeBLEU
 
 # helper functions

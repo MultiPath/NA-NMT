@@ -12,7 +12,9 @@ import copy
 
 from ez_train import train_model
 from decode import decode_model
-from model import Transformer, FastTransformer, INF, TINY, softmax
+from ez_real_time import try_model
+
+from model import Transformer, FastTransformer, SimultaneousTransformer, GridSampler, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
 
@@ -40,6 +42,10 @@ parser.add_argument('--max_len',      type=int, default=None,  help='limit the t
 # model basic settings
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
 parser.add_argument('--params', type=str, default='james-iwslt', help='pamarater sets: james-iwslt, t2t-base, etc')
+
+# real-time translation
+parser.add_argument('--realtime', action='store_true', help='running as a simultaneous translator')
+parser.add_argument('--pretrained_from', type=str, default=None, help='load from a Transformer checkpoint')
 
 # model ablation settings
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
@@ -229,13 +235,33 @@ logger.info(args)
 
 hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
-        f"{args.drop_ratio:.3f}_{args.warmup}_{'uni_' if args.causal_enc else ''}")
+        f"{args.drop_ratio:.3f}_{args.warmup}_{'uni_' if args.causal_enc else ''}"
+        f"{'simul_' if args.realtime else ''}")
 logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = './models/' + args.prefix + hp_str
 
 # build the model
-model = Transformer(SRC, TRG, args)
+if args.realtime:
+    model = SimultaneousTransformer(SRC, TRG, args)
+    sampler = GridSampler(args.d_model)
+else:
+    model = Transformer(SRC, TRG, args)
+    sampler = None
+
 logger.info(str(model))
+
+# read-pretrained translation model.
+if args.pretrained_from is not None:
+    with torch.cuda.device(args.gpu):
+        model.load_state_dict(torch.load('./models/' + args.pretrained_from + '.pt',
+        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+    pre_model = copy.deepcopy(model)
+    for p in pre_model.parameters():
+        p.require_grad = False
+else:
+    pre_model = None
+
+# load the trained model (for resume)
 if args.load_from is not None:
     with torch.cuda.device(args.gpu):
         model.load_state_dict(torch.load('./models/' + args.load_from + '.pt',
@@ -249,19 +275,24 @@ if args.gpu > -1:
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
 
 # ----------------------------------------------------------------------------------------------------------------- #
-if args.mode == 'train':
-    logger.info('starting training')
-    train_model(args, model, train_real, dev_real)
 
-elif args.mode == 'test':
-    logger.info('starting decoding from the pre-trained model, on the test set...')
-    name_suffix = '{}_b={}_model_{}.txt'.format(args.decode_mode, args.beam_size, args.load_from)
-    names = ['src.{}'.format(name_suffix), 'trg.{}'.format(name_suffix),'dec.{}'.format(name_suffix)]
+if not args.realtime:
+    if args.mode == 'train':
+        logger.info('starting training')
+        train_model(args, model, train_real, dev_real)
 
-    if args.model is FastTransformer:
-        names += ['fer.{}'.format(name_suffix)]
-    if args.rerank_by_bleu:
-        teacher_model = None
-    decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
+    elif args.mode == 'test':
+        logger.info('starting decoding from the pre-trained model, on the test set...')
+        name_suffix = '{}_b={}_model_{}.txt'.format(args.decode_mode, args.beam_size, args.load_from)
+        names = ['src.{}'.format(name_suffix), 'trg.{}'.format(name_suffix),'dec.{}'.format(name_suffix)]
+
+        if args.model is FastTransformer:
+            names += ['fer.{}'.format(name_suffix)]
+        if args.rerank_by_bleu:
+            teacher_model = None
+        decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
+
+else:
+    try_model(args, model, sampler, train_real, dev_real)
 
 logger.info("done.")
