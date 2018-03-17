@@ -2,19 +2,14 @@
 python ez_run.py \
                 --prefix [time] \
                 --gpu 2 \
-                --eval-every 100 \
+                --eval-every 500 \
                 --dataset iwslt \
                 --tensorboard \
                 --data_prefix "/data0/data/transformer_data/" \
                 --workspace_prefix "/data0/workspace/simultrans/" \
                 --use_wo \
                 --share_embeddings \
-                --realtime \
-                --traj_size 10 \
-                --delay_weight 0.2 \
-                --batch_size 256 \
-                --pretrained_from "03.10_10.13.iwslt_subword_278_507_5_2_0.079_746_uni_" \
-                --tensorboard
+                --causal_enc \
                 #--debug
                 #--params base-t2t \
                 #--fast --use_alignment --diag --positional_attention \

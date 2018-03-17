@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Variable, Function
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
-
+from torch.distributions import Bernoulli
 import math
 
 from utils import computeGLEU, masked_sort, unsorted
@@ -47,6 +47,12 @@ def positional_encodings_like(x, t=None):   # hope to be differentiable
         encodings = encodings.unsqueeze(0).expand_as(x)
 
     return encodings
+
+def get_range(L, var=None):
+    l = torch.arange(0, L)
+    if (var is not None) and (var.is_cuda):
+        l = l.cuda(var.get_device())
+    return l
 
 class Linear(nn.Linear):
 
@@ -102,7 +108,7 @@ def demask(inputs, the_mask):
 # F.softmax has strange default behavior, normalizing over dim 0 for 3D inputs
 def softmax(x):
     if x.dim() == 3:
-        return F.softmax(x.transpose(0, 2)).transpose(0, 2)
+        return F.softmax(x, dim=2)
     return F.softmax(x)
 
 def log_softmax(x):
@@ -277,11 +283,12 @@ class Attention(nn.Module):
             # dot_products.data.sub_(eye.unsqueeze(0))
 
         if mask is not None:
-            # print(dot_products.data.size(), mask[:, None, :].size())
             if dot_products.dim() == 2:
                 dot_products.data -= ((1 - mask) * INF)
             else:
-                dot_products.data -= ((1 - mask[:, None, :]) * INF)
+                if mask.dim() == 2:
+                    mask = mask[:, None, :]
+                dot_products.data -= ((1 - mask) * INF)
 
         if value is None:
             return dot_products
@@ -321,7 +328,10 @@ class MultiHead2(nn.Module):
         query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N)
                                 for x in (query, key, value))
         if mask is not None:
-            mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
+            if mask.dim() == 2:
+                mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B * N, -1)
+            else:  # make it possible to accept 3D masks
+                mask = mask[:, None, :, :].expand(B, N, Tq, Tk).contiguous().view(B * N, Tq, Tk)
         outputs = self.attention(query, key, value, mask, probs, beta, tau, weights)  # (B x n) x T x (D/n)
         outputs = outputs.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, -1, D)
 
@@ -331,41 +341,6 @@ class MultiHead2(nn.Module):
         if self.use_wo:
             return self.wo(outputs)
         return outputs
-
-
-class MoEHead(nn.Module):
-
-    def __init__(self, d_key, d_value, n_heads, drop_ratio,
-                causal=False, diag=False, window=-1, noisy=False, use_wo=True):
-        super().__init__()
-        self.attention = Attention(d_key, drop_ratio, causal=causal, diag=diag, window=window, noisy=noisy)
-        self.wq = Linear(d_key, d_key, bias=use_wo)
-        self.wk = Linear(d_key, d_key, bias=use_wo)
-        self.wv = Linear(d_value, d_value, bias=use_wo)
-        self.wo = Linear(d_value, d_key, bias=use_wo)
-        self.gate = Linear(d_value // n_heads, 1)
-        self.use_wo = use_wo
-        self.n_heads = n_heads
-
-    def forward(self, query, key, inputs, mask=None, feedback=None, weights=None, beta=0, tau=1):
-        query, key, value = self.wq(query), self.wk(key), self.wv(inputs)   # B x T x D
-        B, Tq, D = query.size()
-        _, Tk, _ = key.size()
-        N = self.n_heads
-        probs = []
-
-        query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N)
-                                for x in (query, key, value))
-        if mask is not None:
-            mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
-        probs = self.attention(query, key, None, mask, probs, beta, tau, weights)  # (B x N) x Tq x Tk
-        mix = matmul(self.attention.dropout(probs), value).contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous() # B x Tq x N x D//N
-        mix = softmax(self.gate(mix))  # B x Tq x N
-        probs = (probs.contiguous().view(B, N, Tq, Tk).transpose(2, 1) * mix).sum(-2)  # B x Tq x Tk
-
-        outputs = matmul(probs, inputs) # B x Tq x D
-        return self.wo(outputs)
-
 
 class ReorderHead(nn.Module):
 
@@ -985,20 +960,152 @@ class Transformer(nn.Module):
             loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
         return self.apply_mask_cost(loss, decoder_masks, batched)
 
+
 class GridSampler(nn.Module):
 
     def __init__(self, d):
         super().__init__()
-        self.w1 = Linear(d, 1, bias=False)
-        self.w2 = Linear(d, 1, bias=False)
+        self.w1 = Linear(d, d, bias=False)
+        self.w2 = Linear(d, d, bias=False)
+        self.w3 = Linear(d, 2)
 
-    def forward(self, x, y):
+    def trace_actions(self, sample, masks):
+        sample = sample.data
+        B, N, Lx, Ly = sample.size()
+        lens = Lx + Ly
+
+        # prepare the data
+        traj = sample.new(B, N, lens).zero_()
+        traj_mask = masks.new(B, N, lens).zero_()
+        path_mask = masks.new(B, N, Lx, Ly).zero_()
+        source_mask = masks.new(B, N, Lx, Ly).zero_()
+
+        for i in range(B):
+            for j in range(N):
+                x, y = 0, 0
+                for k in range(lens):
+                    u = sample[i, j, x, y]
+
+                    c1 = ((y == (Ly - 1)) or (masks[i, j, x, y + 1] == 0))
+                    c2 = ((x == (Lx - 1)) or (masks[i, j, x + 1, y] == 0))
+
+                    if (c1 and c2):
+                        break
+                    elif c1:
+                        u = 0
+                    elif c2:
+                        u = 1
+
+                    traj[i, j, k] = u
+                    traj_mask[i, j, k] = 1
+                    path_mask[i, j, x, y] = 1
+
+                    if u == 0:
+                        x += 1
+                    else:
+                        y += 1
+
+        source_mask[:, :, :-1, :] = (torch.cumsum(path_mask, dim=-1) > 0).float()[:, :, 1:, :]
+        return traj, traj_mask, path_mask, source_mask
+
+    def trace_actions_beam(self, probs, masks, n=10):
+        probs = probs.data
+        logprobs1 = -torch.log(probs + TINY).cpu().numpy() 
+        logprobs0 = -torch.log(1 - probs + TINY).cpu().numpy()
+        
+        B, Lx, Ly = probs.size()
+        lens = Lx + Ly
+        N = n
+        
+        # prepare the data
+        traj = probs.new(B, N, lens).zero_()
+        traj_mask = masks.new(B, N, lens).zero_()
+        sample = masks.new(B, N, Lx, Ly).zero_()
+        path_mask = masks.new(B, N, Lx, Ly).zero_()
+        source_mask = masks.new(B, N, Lx, Ly).zero_()
+
+        for i in range(B):
+            actions = [[[0], [0], 0]]
+            for k in range(Lx + Ly):
+                tmp_action = []
+
+                for a in actions:
+                    x, y, s = a[0][-1], a[1][-1], a[2]
+                    c1 = ((y == (Ly - 1)) or (masks[i, x, y + 1] == 0))
+                    c2 = ((x == (Lx - 1)) or (masks[i, x + 1, y] == 0))
+                    if (c1 and c2):
+                        break
+                    elif c1:
+                        tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))
+                    elif c2:
+                        tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))
+                    else:
+                        tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))
+                        tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))
+
+                if len(tmp_action) == 0:
+                    break
+
+                # sort
+                actions = sorted(tmp_action, key=lambda a:a[2])[:n]
+
+            for j in range(N):
+                if j == len(actions):
+                    break
+
+                for l in range(len(actions[j][0]) - 1):
+                    x0 = actions[j][0][l]
+                    x1 = actions[j][0][l + 1]
+                    y0 = actions[j][1][l]
+                    y1 = actions[j][1][l + 1]
+
+                    if (x1 == x0):  # write a word
+                        traj[i, j, l] = 1
+                        sample[i, j, x0, y0] = 1
+                    elif (y1 == y0):
+                        traj[i, j, l] = 0
+                        sample[i, j, x0, y0] = 0
+                    else:
+                        raise("Error")
+
+                    traj_mask[i, j, l] = 1
+                    path_mask[i, j, x0, y0] = 1
+
+        source_mask[:, :, :-1, :] = (torch.cumsum(path_mask, dim=-1) > 0).float()[:, :, 1:, :]
+        sample = Variable(sample)
+        return actions, sample, traj, traj_mask, path_mask, source_mask
+
+
+    def forward(self, x, y, x_mask, y_mask, n=0, stochastic=True):
         # x: batch * lx * d
         # y: batch * ly * d
-        vx = self.w1(x).expand(x.size(0), x.size(1), y.size(1))
-        vy = self.w2(y).expand(y.size(0), y.size(1), x.size(1)).transpose(1, 2)
-        probs = F.sigmoid(vx + vy)
-        return probs
+        B, Lx, D = x.size()
+        _, Ly, _ = y.size()
+        vx = self.w1(x)[:, :, None, :].expand(B, Lx, Ly, D)
+        vy = self.w2(y)[:, None, :, :].expand(B, Lx, Ly, D)
+        mx = x_mask[:, :, None].expand(B, Lx, Ly)
+        my = y_mask[:, None, :].expand(B, Lx, Ly)
+
+        probs = F.softmax(self.w3(F.relu(vx + vy) / 10.0), dim=-1)[:, :, :, 0]
+        masks = mx * my
+
+        if (not stochastic) and (n > 1):  # beam-search
+            actions, samples, traj, traj_mask, path_mask, source_mask = self.trace_actions_beam(probs, masks, n)
+            masks = masks[:, None, :, :].expand(B, n, Lx, Ly)
+            probs = probs[:, None, :, :].expand(B, n, Lx, Ly)
+
+        else:
+            if stochastic:
+                sampler = Bernoulli(probs)
+                samples = sampler.sample_n(n).transpose(1, 0)
+            else:
+                samples = (probs > 0.5)[:, None, :, :].float()
+
+            masks = masks[:, None, :, :].expand(B, n, Lx, Ly)
+            probs = probs[:, None, :, :].expand(B, n, Lx, Ly)
+            traj, traj_mask, path_mask, source_mask = self.trace_actions(samples, masks)
+    
+        return probs, masks, samples, traj, traj_mask, path_mask, source_mask
 
 
 class SimultaneousTransformer(Transformer):

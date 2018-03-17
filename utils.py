@@ -314,3 +314,81 @@ def merge_cache(decoding_path, names0, last_epoch=0, max_cache=20):
         os.system(code)
     os.remove(decoding_path + '/_temp_decode')
 
+
+### ------ functions in real-time translation ---- ####
+
+def get_nll(model, inputs, input_masks, targets, target_masks, encoding, traj_source_mask):
+    traj_source_mask = traj_source_mask.transpose(2, 3)
+    B, N, Ly, Lx = traj_source_mask.size()
+    
+    # expand and reshaping everything
+    inputs = inputs[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
+    input_masks = input_masks[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
+    targets = targets[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
+    target_masks = target_masks[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
+    traj_source_mask = traj_source_mask.contiguous().view(B * N, Ly, Lx)
+    
+    for i in range(len(encoding)):
+        d = encoding[i].size()[-1]
+        encoding[i] = encoding[i][:, None, :, :].expand(B, N, Lx, d).contiguous().view(B * N, Lx, d)
+
+    # compute the loss
+    traj_decoder_out, traj_decoder_probs = model(encoding, traj_source_mask, inputs, input_masks, return_probs=True)
+    cost, loss = model.batched_cost(targets, target_masks, traj_decoder_probs, batched=True)
+    return loss.view(B, N)
+
+def get_delay(traj_source_mask, masks=None, target_masks=None, type = "max"):
+
+    def get_ap_delay(traj_source_mask, masks):
+        B, N, Lx, Ly = traj_source_mask.size()
+        mask_sum = masks.sum(dim=-1).sum(dim=-1) + TINY
+        ap = traj_source_mask.sum(dim=-1).sum(dim=-1) / mask_sum
+        return ap
+
+    def get_df_delay(traj_source_mask, masks):
+        Lxs = masks[:, :, :, 0].sum(-1)
+        Lys = masks[:, :, 0, :].sum(-1)
+        speed = Lys / Lxs
+        diff_sum = traj_source_mask.sum(-1).sum(-1) * speed
+        diff_avg = Variable((diff_sum - Lys * Lys / 2) / Lys)
+        return diff_avg
+
+    def get_max_delay(traj_source_mask, masks):
+        Lxs = masks[:, :, :, 0].sum(-1)
+        Lys = masks[:, :, 0, :].sum(-1)
+        speed = Lys / Lxs   
+        y_progress = torch.arange(1, masks.size(-1) + 1)
+        if traj_source_mask.is_cuda:
+            with torch.cuda.device_of(traj_source_mask):
+                y_progress = y_progress.cuda()
+        
+        diff_sum = traj_source_mask.sum(-2) * speed[:, :, None]
+        diff_sum = diff_sum - y_progress[None, None, :].expand_as(diff_sum)
+        diff_sum *= masks[:, :, 0, :]
+        diff_max = Variable(torch.max(diff_sum, dim=-1)[0])
+        return diff_max
+
+    def get_cw_delay(traj_source_mask, target_masks):
+        B, N, Lx, Ly = traj_source_mask.size()
+        target_masks = target_masks[:, None, :].expand(B, N, Ly)
+
+        read_words = traj_source_mask.sum(dim=2)
+        #print(read_words[0, 0:1])
+        cw_words = read_words
+        cw_words[:, :, 1:] -= cw_words[:, :, :-1]
+        cw_words *= target_masks
+        cw_mask = (cw_words > 0).float()
+        cw = Variable(cw_words.sum(-1) / (TINY + cw_mask * target_masks).sum(-1))
+        return cw
+
+    if type == "max":
+        return get_max_delay(traj_source_mask, masks)
+    elif type == "ap":
+        return get_ap_delay(traj_source_mask, masks)
+    elif type == "df":
+        return get_df_delay(traj_source_mask, masks)
+    elif type == "cw":
+        return get_cw_delay(traj_source_mask, target_masks)
+    else:
+        raise NotImplementedError
+

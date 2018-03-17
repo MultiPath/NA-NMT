@@ -82,11 +82,7 @@ def valid_model(args, model, dev, dev_metrics=None, distillation=False, print_ou
     return outputs
 
 
-def train_model(args, model, train, dev, save_path=None, maxsteps=None):
-
-    if args.tensorboard and (not args.debug):
-        from tensorboardX import SummaryWriter
-        writer = SummaryWriter('./runs/{}'.format(args.prefix+args.hp_str))
+def train_model(args, model, train, dev, save_path=None, maxsteps=None, writer=None):
 
     # optimizer
     if args.optimizer == 'Adam':
@@ -97,7 +93,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     # if resume training
     if (args.load_from is not None) and (args.resume):
         with torch.cuda.device(args.gpu):   # very important.
-            offset, opt_states = torch.load('./models/' + args.load_from + '.pt.states',
+            offset, opt_states = torch.load(args.workspace_prefix + '/models/' + args.load_from + '.pt.states',
                                             map_location=lambda storage, loc: storage.cuda())
             opt.load_state_dict(opt_states)
     else:

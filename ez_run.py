@@ -12,22 +12,19 @@ import copy
 
 from ez_train import train_model
 from decode import decode_model
-from ez_real_time import try_model
+from ez_real_time import p_step, q_step
 
 from model import Transformer, FastTransformer, SimultaneousTransformer, GridSampler, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
 
-# check the path
-for d in ['models', 'runs', 'logs']:
-    if not os.path.exists('./{}'.format(d)):
-        os.mkdir('./{}'.format(d))
 
 # all the hyper-parameters
 parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 
 # dataset settings
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
+parser.add_argument('--workspace_prefix', type=str, default='./')
 parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
 parser.add_argument('--language',    type=str, default='ende',  help='a combination of two language markers to show the language pair.')
 parser.add_argument('--data_group',  type=str, default=None,  help='dataset group')
@@ -46,6 +43,9 @@ parser.add_argument('--params', type=str, default='james-iwslt', help='pamarater
 # real-time translation
 parser.add_argument('--realtime', action='store_true', help='running as a simultaneous translator')
 parser.add_argument('--pretrained_from', type=str, default=None, help='load from a Transformer checkpoint')
+parser.add_argument('--traj_size', type=int, default=10, help="sample size of trajectories")
+parser.add_argument('--delay_type', type=str, default="max")
+parser.add_argument('--delay_weight', type=float, default=0.2)
 
 # model ablation settings
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
@@ -98,6 +98,17 @@ args = parser.parse_args()
 if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.", gmtime())
 
+# check the path
+def build_path(prefix, name):
+    pathname = os.path.join(prefix, name)
+    if not os.path.exists(pathname):
+        os.mkdir(pathname)
+    return pathname
+
+model_dir = build_path(args.workspace_prefix, "models")
+run_dir = build_path(args.workspace_prefix, "runs")
+log_dir = build_path(args.workspace_prefix, "logs")
+
 # get the langauage pairs:
 args.src = args.language[:2]  # source language
 args.trg = args.language[2:]  # target language
@@ -107,7 +118,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-fh = logging.FileHandler('./logs/log-{}.txt'.format(args.prefix))
+fh = logging.FileHandler('{}/log-{}.txt'.format(log_dir, args.prefix))
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(formatter)
 ch = logging.StreamHandler()
@@ -238,7 +249,7 @@ hp_str = (f"{args.dataset}_subword_"
         f"{args.drop_ratio:.3f}_{args.warmup}_{'uni_' if args.causal_enc else ''}"
         f"{'simul_' if args.realtime else ''}")
 logger.info(f'Starting with HPARAMS: {hp_str}')
-model_name = './models/' + args.prefix + hp_str
+model_name = model_dir + '/' + args.prefix + hp_str
 
 # build the model
 if args.realtime:
@@ -253,7 +264,7 @@ logger.info(str(model))
 # read-pretrained translation model.
 if args.pretrained_from is not None:
     with torch.cuda.device(args.gpu):
-        model.load_state_dict(torch.load('./models/' + args.pretrained_from + '.pt',
+        model.load_state_dict(torch.load(model_dir + '/' + args.pretrained_from + '.pt',
         map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
     pre_model = copy.deepcopy(model)
     for p in pre_model.parameters():
@@ -264,22 +275,31 @@ else:
 # load the trained model (for resume)
 if args.load_from is not None:
     with torch.cuda.device(args.gpu):
-        model.load_state_dict(torch.load('./models/' + args.load_from + '.pt',
+        model.load_state_dict(torch.load(model_dir + '/' + args.load_from + '.pt',
         map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
 # use cuda
 if args.gpu > -1:
     model.cuda(args.gpu)
+    if pre_model is not None:
+        pre_model.cuda(args.gpu)
+
+    if sampler is not None:
+        sampler.cuda(args.gpu)
 
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
 
 # ----------------------------------------------------------------------------------------------------------------- #
+# tensorboard
+if args.tensorboard and (not args.debug):
+    from tensorboardX import SummaryWriter
+    writer = SummaryWriter('{}/{}'.format(run_dir, args.prefix + args.hp_str))
 
 if not args.realtime:
     if args.mode == 'train':
         logger.info('starting training')
-        train_model(args, model, train_real, dev_real)
+        train_model(args, model, train_real, dev_real, writer=writer)
 
     elif args.mode == 'test':
         logger.info('starting decoding from the pre-trained model, on the test set...')
@@ -293,6 +313,6 @@ if not args.realtime:
         decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
 
 else:
-    try_model(args, model, sampler, train_real, dev_real)
+    q_step(args, model, sampler, train_real, dev_real, maxsteps=40000, writer=writer)
 
 logger.info("done.")
