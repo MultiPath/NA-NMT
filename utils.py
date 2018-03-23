@@ -317,26 +317,6 @@ def merge_cache(decoding_path, names0, last_epoch=0, max_cache=20):
 
 ### ------ functions in real-time translation ---- ####
 
-def get_nll(model, inputs, input_masks, targets, target_masks, encoding, traj_source_mask):
-    traj_source_mask = traj_source_mask.transpose(2, 3)
-    B, N, Ly, Lx = traj_source_mask.size()
-    
-    # expand and reshaping everything
-    inputs = inputs[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
-    input_masks = input_masks[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
-    targets = targets[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
-    target_masks = target_masks[:, None, :].expand(B, N, Ly).contiguous().view(B * N, Ly)
-    traj_source_mask = traj_source_mask.contiguous().view(B * N, Ly, Lx)
-    
-    for i in range(len(encoding)):
-        d = encoding[i].size()[-1]
-        encoding[i] = encoding[i][:, None, :, :].expand(B, N, Lx, d).contiguous().view(B * N, Lx, d)
-
-    # compute the loss
-    traj_decoder_out, traj_decoder_probs = model(encoding, traj_source_mask, inputs, input_masks, return_probs=True)
-    cost, loss = model.batched_cost(targets, target_masks, traj_decoder_probs, batched=True)
-    return loss.view(B, N)
-
 def get_delay(traj_source_mask, masks=None, target_masks=None, type = "max"):
 
     def get_ap_delay(traj_source_mask, masks):

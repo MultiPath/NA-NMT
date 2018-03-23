@@ -12,7 +12,7 @@ import copy
 
 from ez_train import train_model
 from decode import decode_model
-from ez_real_time import p_step, q_step
+from ez_real_time import *
 
 from model import Transformer, FastTransformer, SimultaneousTransformer, GridSampler, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
@@ -43,6 +43,8 @@ parser.add_argument('--params', type=str, default='james-iwslt', help='pamarater
 # real-time translation
 parser.add_argument('--realtime', action='store_true', help='running as a simultaneous translator')
 parser.add_argument('--pretrained_from', type=str, default=None, help='load from a Transformer checkpoint')
+parser.add_argument('--load_sampler_from', type=str, default=None, help='load from a GridSampler checkpoint')
+parser.add_argument('--load_actor_from', type=str, default=None, help='load from a GridSampler checkpoint')
 parser.add_argument('--traj_size', type=int, default=10, help="sample size of trajectories")
 parser.add_argument('--delay_type', type=str, default="max")
 parser.add_argument('--delay_weight', type=float, default=0.2)
@@ -143,6 +145,7 @@ SRC   = DataField(batch_first=True) if not args.share_embeddings else TRG
 
 # setup many datasets (need to manaually setup)
 data_prefix = args.data_prefix
+action_path = None
 if args.dataset == 'iwslt':
     if args.test_set is None:
         args.test_set = 'IWSLT16.TED.tst2013'
@@ -160,7 +163,7 @@ if args.dataset == 'iwslt':
         fields=[('src', SRC), ('trg', TRG)],
         load_dataset=args.load_dataset, prefix='ts')
 
-    decoding_path = data_prefix + 'iwslt/en-de/{}.en-de.bpe.new'
+    action_path = data_prefix + 'iwslt/en-de/{}.en-de.bpe.action'
 
 else:
     raise NotImplementedError
@@ -255,9 +258,10 @@ model_name = model_dir + '/' + args.prefix + hp_str
 if args.realtime:
     model = SimultaneousTransformer(SRC, TRG, args)
     sampler = GridSampler(args.d_model)
+    actor = GridSampler(args.d_model)
 else:
     model = Transformer(SRC, TRG, args)
-    sampler = None
+    sampler, actor = None, None
 
 logger.info(str(model))
 
@@ -278,14 +282,32 @@ if args.load_from is not None:
         model.load_state_dict(torch.load(model_dir + '/' + args.load_from + '.pt',
         map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
+if args.load_sampler_from is not None:
+    assert sampler is not None, 'only works on simultaneous translation'
+    with torch.cuda.device(args.gpu):
+        sampler.load_state_dict(torch.load(model_dir + '/' + args.load_sampler_from + '.pt',
+        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+if args.load_actor_from is not None:
+    assert actor is not None, 'only works on simultaneous translation'
+    with torch.cuda.device(args.gpu):
+        actor.load_state_dict(torch.load(model_dir + '/' + args.load_actor_from + '.pt',
+        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+
 # use cuda
 if args.gpu > -1:
     model.cuda(args.gpu)
+
     if pre_model is not None:
         pre_model.cuda(args.gpu)
 
     if sampler is not None:
         sampler.cuda(args.gpu)
+
+    if actor is not None:
+        actor.cuda(args.gpu)
+
 
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
@@ -295,7 +317,9 @@ args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': log
 if args.tensorboard and (not args.debug):
     from tensorboardX import SummaryWriter
     writer = SummaryWriter('{}/{}'.format(run_dir, args.prefix + args.hp_str))
-
+else:
+    writer = None
+    
 if not args.realtime:
     if args.mode == 'train':
         logger.info('starting training')
@@ -313,6 +337,8 @@ if not args.realtime:
         decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
 
 else:
-    q_step(args, model, sampler, train_real, dev_real, maxsteps=40000, writer=writer)
+    if args.mode == 'train':
+        # q_step(args, model, sampler, train_real, dev_real, maxsteps=40000, writer=writer)
+        full_step(args, pre_model, model, actor, sampler, train_real, dev_real, writer)
 
 logger.info("done.")

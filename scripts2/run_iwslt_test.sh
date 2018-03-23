@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 python ez_run.py \
                 --prefix [time] \
-                --gpu 2 \
+                --gpu 0 \
                 --eval-every 100 \
                 --dataset iwslt \
                 --tensorboard \
@@ -14,7 +14,10 @@ python ez_run.py \
                 --delay_weight 0.2 \
                 --batch_size 256 \
                 --pretrained_from "03.10_10.13.iwslt_subword_278_507_5_2_0.079_746_uni_" \
-                --tensorboard
+                --load_sampler_from "03.16_08.24.iwslt_subword_278_507_5_2_0.079_746_simul_.Q." \
+                --mode train \
+                --debug
+                #--tensorboard
                 #--debug
                 #--params base-t2t \
                 #--fast --use_alignment --diag --positional_attention \

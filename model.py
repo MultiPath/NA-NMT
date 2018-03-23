@@ -1075,18 +1075,24 @@ class GridSampler(nn.Module):
         sample = Variable(sample)
         return actions, sample, traj, traj_mask, path_mask, source_mask
 
+    def step(self, x, y):
+        B, Lx, D = x.size()
+        _, Ly, _ = y.size()
 
-    def forward(self, x, y, x_mask, y_mask, n=0, stochastic=True):
-        # x: batch * lx * d
-        # y: batch * ly * d
+        vx = self.w1(x)[:, :, None, :].expand(B, Lx, Ly, D)
+        vy = self.w2(y)[:, None, :, :].expand(B, Lx, Ly, D)
+        probs = F.softmax(self.w3(F.relu(vx + vy) / 10.0), dim=-1)[:, :, :, 0]
+        return probs
+
+    def forward(self, x, y, x_mask, y_mask, n=0, stochastic=True, sample=True):
         B, Lx, D = x.size()
         _, Ly, _ = y.size()
         vx = self.w1(x)[:, :, None, :].expand(B, Lx, Ly, D)
         vy = self.w2(y)[:, None, :, :].expand(B, Lx, Ly, D)
+        probs = F.softmax(self.w3(F.relu(vx + vy) / 10.0), dim=-1)[:, :, :, 0]
+
         mx = x_mask[:, :, None].expand(B, Lx, Ly)
         my = y_mask[:, None, :].expand(B, Lx, Ly)
-
-        probs = F.softmax(self.w3(F.relu(vx + vy) / 10.0), dim=-1)[:, :, :, 0]
         masks = mx * my
 
         if (not stochastic) and (n > 1):  # beam-search
@@ -1115,6 +1121,10 @@ class SimultaneousTransformer(Transformer):
         self.encoder = Encoder(src, args, causal=True)
         self.decoder = Decoder(trg, args, causal=True)
         self.field = trg
+    
+    def simultaneous_greedy_decoding(self):
+        
+        pass 
 
 
 class FastTransformer(Transformer):
