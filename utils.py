@@ -372,3 +372,31 @@ def get_delay(traj_source_mask, masks=None, target_masks=None, type = "max"):
     else:
         raise NotImplementedError
 
+def get_delay_online(traj, speed=1, type = "max"):
+
+    def get_ap_delay(traj, masks):
+        raise NotImplementedError
+
+    def get_df_delay(traj):
+        raise NotImplementedError
+
+    def get_max_delay(traj):
+        diffs = [0]
+        for t in traj:
+            diffs.append(diffs[-1] + speed * (1 - t) - t)
+        diff_max = max(diffs)
+        return diff_max
+
+    def get_cw_delay(traj_source_mask, target_masks):
+        raise NotImplementedError
+
+    if type == "max":
+        return get_max_delay(traj)
+    elif type == "ap":
+        return get_ap_delay(traj)
+    elif type == "df":
+        return get_df_delay(traj)
+    elif type == "cw":
+        return get_cw_delay(traj)
+    else:
+        raise NotImplementedError

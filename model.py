@@ -281,6 +281,7 @@ class Attention(nn.Module):
             dot_products.data.scatter_(1, inds.expand(dot_products.size(0), 1, inds.size(-1)), -INF)
             # eye = key.data.new(key.size(1), key.size(1)).fill_(1).eye() * INF
             # dot_products.data.sub_(eye.unsqueeze(0))
+       
 
         if mask is not None:
             if dot_products.dim() == 2:
@@ -327,6 +328,7 @@ class MultiHead2(nn.Module):
 
         query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N)
                                 for x in (query, key, value))
+        
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B * N, -1)
@@ -682,6 +684,69 @@ class Decoder(nn.Module):
                 return outs[:, 0, 1:]
         return outs[:, 0, 1:]
 
+    def simultaneous_greedy(self, actor, encoding, mask_src=None, mask_trg=None):
+
+        encoding = encoding[1:]
+        B, T, C = encoding[0].size()  # batch-size, decoding-length, size
+        T = (self.length_ratio + 1) * T
+
+        outs = Variable(encoding[0].data.new(B, T + 1).long().fill_(
+                    self.field.vocab.stoi['<init>']))
+        traj = Variable(encoding[0].data.new(B, T + 1).float().fill_(0)) 
+        hiddens = [Variable(encoding[0].data.new(B, T, C).zero_())
+                    for l in range(len(self.layers) + 1)]
+        embedW = self.out.weight * math.sqrt(self.d_model)
+        hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
+
+        eos_yet = encoding[0].data.new(B).byte().zero_()
+        read_yet = encoding[0].data.new(B).byte().zero_()
+        source_lens = mask_src.sum(dim=1)
+
+        # prepare the inital mask
+        moving_src_mask = mask_src * 0
+        moving_src_mask[:, 0] += 1  # we can read the first word
+        moving_trg_mask = mask_src.new(B, T).float().fill_(1)
+
+
+        for t in range(T):
+            hiddens[0][:, t] = self.dropout(
+                hiddens[0][:, t] + F.embedding(outs[:, t], embedW))
+
+            inter_attention = []
+            for l in range(len(self.layers)):
+                x = hiddens[l][:, :t+1]      # read the decoder
+                x = self.layers[l].selfattn(hiddens[l][:, t:t+1], x, x, moving_trg_mask[:, :t+1])   # masked self-attention
+                hiddens[l + 1][:, t] = self.layers[l].feedforward(
+                    self.layers[l].attention(x, encoding[l], encoding[l], moving_src_mask, inter_attention))[:, 0]
+
+            # run the actor and word predictor
+            traj[:, t + 1] = ((actor(hiddens[-1][:, t:t+1]) > 0.5) | Variable(read_yet)[:, None]).float()  # READ (0) or WRITE (1) binaries, if read all, then write.
+            _, preds = self.out(hiddens[-1][:, t]).max(-1)
+            
+            # if READ, use input as output
+            preds = preds * traj[:, t + 1].long() + outs[:, t] * (1 - traj[:, t + 1].long())
+
+            # moving the mask for source
+            moving_src_mask[:, 1:] =  moving_src_mask[:, 1:] + (moving_src_mask[:, :-1] - moving_src_mask[:, 1:]) * (1 - traj[:, t + 1: t + 2].data)
+            moving_src_mask = moving_src_mask * mask_src
+
+            # stop reading if everything is read.
+            read_yet = read_yet | (moving_src_mask.sum(dim=1) >= source_lens)
+
+            # moving the mask for target
+            moving_trg_mask[:, t] = traj[:, t + 1].data
+
+            # if EoS
+            preds[eos_yet] = self.field.vocab.stoi['<pad>']
+            eos_yet = eos_yet | (preds.data == self.field.vocab.stoi['<eos>'])
+            outs[:, t + 1] = preds
+            if eos_yet.all():
+                break
+
+        return outs[:, :t+2], traj[:, :t+2]
+
+
+
 class ReOrderer(nn.Module):
 
     def __init__(self, args):
@@ -960,6 +1025,19 @@ class Transformer(nn.Module):
             loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
         return self.apply_mask_cost(loss, decoder_masks, batched)
 
+class Predictor(nn.Module):
+    
+    def __init__(self, d):
+        super().__init__()
+        self.w2 = Linear(d, d, bias=False)
+        self.w3 = Linear(d, 2)
+
+    def forward(self, y):
+        B, Ly, D = y.size()
+        vy = self.w2(y)
+        probs = F.softmax(self.w3(F.relu(vy)), dim=-1)[:, :, 0]
+        # probs = F.softmax(self.w3(y), dim=-1)[:, :, 0]
+        return probs
 
 class GridSampler(nn.Module):
 
@@ -1035,13 +1113,13 @@ class GridSampler(nn.Module):
                     c2 = ((x == (Lx - 1)) or (masks[i, x + 1, y] == 0))
                     if (c1 and c2):
                         break
-                    elif c1:
+                    elif (c1 or (x == 0 and y == 0)):   # first step we need to make sure to READ
                         tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))
                     elif c2:
                         tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))
                     else:
-                        tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))
-                        tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))
+                        tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))  # read
+                        tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))  # write
 
                 if len(tmp_action) == 0:
                     break
@@ -1071,7 +1149,7 @@ class GridSampler(nn.Module):
                     traj_mask[i, j, l] = 1
                     path_mask[i, j, x0, y0] = 1
 
-        source_mask[:, :, :-1, :] = (torch.cumsum(path_mask, dim=-1) > 0).float()[:, :, 1:, :]
+        source_mask[:, :, :-1, :] = (torch.cumsum(path_mask, dim=-1) > 0).float()[:, :, 1:, :]  # source mask need to -1
         sample = Variable(sample)
         return actions, sample, traj, traj_mask, path_mask, source_mask
 
@@ -1109,6 +1187,9 @@ class GridSampler(nn.Module):
 
             masks = masks[:, None, :, :].expand(B, n, Lx, Ly)
             probs = probs[:, None, :, :].expand(B, n, Lx, Ly)
+            
+            # first step must "READ"
+            samples[:, :, 0, 0] = samples[:, :, 0, 0] * 0.0
             traj, traj_mask, path_mask, source_mask = self.trace_actions(samples, masks)
     
         return probs, masks, samples, traj, traj_mask, path_mask, source_mask
@@ -1122,9 +1203,41 @@ class SimultaneousTransformer(Transformer):
         self.decoder = Decoder(trg, args, causal=True)
         self.field = trg
     
-    def simultaneous_greedy_decoding(self):
-        
-        pass 
+    def output_decoding(self, outputs):
+        field, text = outputs
+        if field is 'src':
+            return self.encoder.field.reverse(text.data)
+        else:
+            return self.decoder.field.reverse(text.data)
+
+    def filter_actions(self, out_strings, trajectories):
+        filter_strings = []
+        filter_trajtories = []
+        for out, traj in zip(out_strings, trajectories):
+            l = 0
+            outs = out.split()
+            filtered_outs = []
+            filtered_traj = []
+
+            for t in traj:
+
+                filtered_traj.append(int(t))
+                if t == 0:
+                    if l > 0:
+                        l += 1
+                    pass
+                else:
+                    filtered_outs.append(outs[l])
+                    l += 1
+
+                
+                if l >= len(outs):
+                    break
+
+            filter_strings.append(" ".join(filtered_outs))
+            filter_trajtories.append(filtered_traj)
+        return filter_strings, filter_trajtories
+
 
 
 class FastTransformer(Transformer):

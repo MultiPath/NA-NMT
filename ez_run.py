@@ -14,7 +14,7 @@ from ez_train import train_model
 from decode import decode_model
 from ez_real_time import *
 
-from model import Transformer, FastTransformer, SimultaneousTransformer, GridSampler, INF, TINY, softmax
+from model import Transformer, FastTransformer, SimultaneousTransformer, GridSampler, Predictor, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
 
@@ -258,7 +258,7 @@ model_name = model_dir + '/' + args.prefix + hp_str
 if args.realtime:
     model = SimultaneousTransformer(SRC, TRG, args)
     sampler = GridSampler(args.d_model)
-    actor = GridSampler(args.d_model)
+    actor = Predictor(args.d_model)
 else:
     model = Transformer(SRC, TRG, args)
     sampler, actor = None, None
