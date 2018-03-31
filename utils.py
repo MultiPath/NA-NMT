@@ -77,6 +77,7 @@ class NormalField(data.Field):
                 if w == t:
                     break
                 sentence.append(w)
+                
             return sentence
 
         batch = [trim(ex, self.eos_token) for ex in batch] # trim past frst eos

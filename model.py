@@ -558,15 +558,16 @@ class Decoder(nn.Module):
         self.length_ratio = args.length_ratio
         self.positional = positional
 
-    def forward(self, x, encoding, mask_src=None, mask_trg=None, input_embeddings=False, feedback=None, positions=None):
+    def forward(self, x, encoding, mask_src=None, mask_trg=None, 
+                input_embeddings=False, feedback=None, positions=None):
 
         if not input_embeddings:  # compute input embeddings
             if x.ndimension() == 2:
                 x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
             elif x.ndimension() == 3:  # softmax relaxiation
                 x = x @ self.out.weight * math.sqrt(self.d_model)  # batch x len x embed_size
-
-        x += positional_encodings_like(x)
+        
+        x += positional_encodings_like(x, positions)
         x = self.dropout(x)
 
         for l, (layer, enc) in enumerate(zip(self.layers, encoding[1:])):
@@ -696,21 +697,25 @@ class Decoder(nn.Module):
         hiddens = [Variable(encoding[0].data.new(B, T, C).zero_())
                     for l in range(len(self.layers) + 1)]
         embedW = self.out.weight * math.sqrt(self.d_model)
-        hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
+        # hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
 
         eos_yet = encoding[0].data.new(B).byte().zero_()
         read_yet = encoding[0].data.new(B).byte().zero_()
         source_lens = mask_src.sum(dim=1)
+        target_lens = Variable(encoding[0].data.new(B).float().zero_())
 
         # prepare the inital mask
         moving_src_mask = mask_src * 0
         moving_src_mask[:, 0] += 1  # we can read the first word
         moving_trg_mask = mask_src.new(B, T).float().fill_(1)
-
-
+    
         for t in range(T):
-            hiddens[0][:, t] = self.dropout(
-                hiddens[0][:, t] + F.embedding(outs[:, t], embedW))
+
+            # prepare inputs
+
+            hiddens[0][:, t] = self.dropout(positional_encodings_like(
+                hiddens[0][:, t:t+1], t=target_lens[:, None]).squeeze(1) 
+                + F.embedding(outs[:, t], embedW))
 
             inter_attention = []
             for l in range(len(self.layers)):
@@ -735,6 +740,7 @@ class Decoder(nn.Module):
 
             # moving the mask for target
             moving_trg_mask[:, t] = traj[:, t + 1].data
+            target_lens = target_lens + traj[:, t + 1]
 
             # if EoS
             preds[eos_yet] = self.field.vocab.stoi['<pad>']
@@ -918,13 +924,14 @@ class Transformer(nn.Module):
         return outputs
 
     def apply_mask_cost(self, loss, mask, batched=False):
-        loss.data *= mask
+        mask = Variable(mask)
+        loss = loss * mask
         cost = loss.sum() / (mask.sum() + TINY)
 
         if not batched:
             return cost
 
-        loss = loss.sum(1, keepdim=True) / (TINY + Variable(mask).sum(1, keepdim=True))
+        loss = loss.sum(1, keepdim=True) / (TINY + mask.sum(1, keepdim=True))
         return cost, loss
 
     def output_decoding(self, outputs):
@@ -993,7 +1000,7 @@ class Transformer(nn.Module):
                 decoding=False, beam=1, alpha=0.6, return_probs=False, positions=None, feedback=None):
 
         if (return_probs and decoding) or (not decoding):
-            out = self.decoder(decoder_inputs, encoding, encoder_masks, decoder_masks)
+            out = self.decoder(decoder_inputs, encoding, encoder_masks, decoder_masks, positions=positions)
 
         if decoding:
             if beam == 1:  # greedy decoding
@@ -1064,19 +1071,21 @@ class GridSampler(nn.Module):
                 for k in range(lens):
                     u = sample[i, j, x, y]
 
-                    c1 = ((y == (Ly - 1)) or (masks[i, j, x, y + 1] == 0))
                     c2 = ((x == (Lx - 1)) or (masks[i, j, x + 1, y] == 0))
+                    c1 = ((y == (Ly - 1)) or (masks[i, j, x, y + 1] == 0))
 
-                    if (c1 and c2):
-                        break
-                    elif c1:
-                        u = 0
-                    elif c2:
+                    if c2:
                         u = 1
+                    elif (c1 or (x == 0 and y == 0) or ((y == (Ly - 2)) or (masks[i, j, x, y + 2] == 0))): 
+                        u = 0
+                   
 
                     traj[i, j, k] = u
                     traj_mask[i, j, k] = 1
                     path_mask[i, j, x, y] = 1
+
+                    if (c1 and c2):
+                        break
 
                     if u == 0:
                         x += 1
@@ -1104,19 +1113,19 @@ class GridSampler(nn.Module):
 
         for i in range(B):
             actions = [[[0], [0], 0]]
-            for k in range(Lx + Ly):
+            for k in range(Lx + Ly - 1):
                 tmp_action = []
-
                 for a in actions:
                     x, y, s = a[0][-1], a[1][-1], a[2]
-                    c1 = ((y == (Ly - 1)) or (masks[i, x, y + 1] == 0))
-                    c2 = ((x == (Lx - 1)) or (masks[i, x + 1, y] == 0))
+                    c2 = ((x == (Lx - 1)) or (masks[i, x + 1, y] == 0))  # read all source words
+                    c1 = ((y == (Ly - 1)) or (masks[i, x, y + 1] == 0))  # write all target words
+                    
                     if (c1 and c2):
                         break
-                    elif (c1 or (x == 0 and y == 0)):   # first step we need to make sure to READ
-                        tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))
                     elif c2:
-                        tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))
+                        tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))  
+                    elif (c1 or (x == 0 and y == 0) or ((y == (Ly - 2)) or (masks[i, x, y + 2] == 0))): # <eos> has not output)):   
+                        tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))
                     else:
                         tmp_action.append((a[0] + [x + 1], a[1] + [y], s + logprobs0[i, x, y]))  # read
                         tmp_action.append((a[0] + [x], a[1] + [y + 1], s + logprobs1[i, x, y]))  # write
@@ -1149,6 +1158,12 @@ class GridSampler(nn.Module):
                     traj_mask[i, j, l] = 1
                     path_mask[i, j, x0, y0] = 1
 
+                    if l == (len(actions[j][0]) - 2): # last step, we need to write <eos>
+                        # you forgot to put the last action (WRITE)
+                        traj[i, j, l + 1] = 1
+                        traj_mask[i, j, l + 1] = 1
+                        path_mask[i, j, x1, y1] = 1
+
         source_mask[:, :, :-1, :] = (torch.cumsum(path_mask, dim=-1) > 0).float()[:, :, 1:, :]  # source mask need to -1
         sample = Variable(sample)
         return actions, sample, traj, traj_mask, path_mask, source_mask
@@ -1178,6 +1193,8 @@ class GridSampler(nn.Module):
             masks = masks[:, None, :, :].expand(B, n, Lx, Ly)
             probs = probs[:, None, :, :].expand(B, n, Lx, Ly)
 
+            # print(actions)
+            
         else:
             if stochastic:
                 sampler = Bernoulli(probs)

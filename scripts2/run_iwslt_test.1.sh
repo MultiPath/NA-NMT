@@ -10,14 +10,16 @@ python ez_run.py \
                 --use_wo \
                 --share_embeddings \
                 --realtime \
-                --traj_size 4 \
+                --traj_size 5 \
                 --delay_weight 0.2 \
                 --batch_size 512 \
                 --pretrained_from "03.10_10.13.iwslt_subword_278_507_5_2_0.079_746_uni_" \
-                --load_sampler_from "03.16_08.24.iwslt_subword_278_507_5_2_0.079_746_simul_.Q." \
                 --mode train \
+                --p_steps 100 \
+                --q_steps 100 \
                 --debug
                 #--tensorboard
                 #--debug
                 #--params base-t2t \
                 #--fast --use_alignment --diag --positional_attention \
+                # --load_sampler_from "03.16_08.24.iwslt_subword_278_507_5_2_0.079_746_simul_.Q." \

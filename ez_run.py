@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 from torchtext import data
 from torchtext import datasets
@@ -17,6 +18,7 @@ from ez_real_time import *
 from model import Transformer, FastTransformer, SimultaneousTransformer, GridSampler, Predictor, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
+from collections import namedtuple
 
 
 # all the hyper-parameters
@@ -48,6 +50,8 @@ parser.add_argument('--load_actor_from', type=str, default=None, help='load from
 parser.add_argument('--traj_size', type=int, default=10, help="sample size of trajectories")
 parser.add_argument('--delay_type', type=str, default="max")
 parser.add_argument('--delay_weight', type=float, default=0.2)
+parser.add_argument('--p_steps', type=int, default=100, help="alternating training, P steps")
+parser.add_argument('--q_steps', type=int, default=100, help="alternating training, Q steps")
 
 # model ablation settings
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
@@ -254,73 +258,30 @@ hp_str = (f"{args.dataset}_subword_"
 logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = model_dir + '/' + args.prefix + hp_str
 
-# build the model
-if args.realtime:
-    model = SimultaneousTransformer(SRC, TRG, args)
-    sampler = GridSampler(args.d_model)
-    actor = Predictor(args.d_model)
-else:
-    model = Transformer(SRC, TRG, args)
-    sampler, actor = None, None
-
-logger.info(str(model))
-
-# read-pretrained translation model.
-if args.pretrained_from is not None:
-    with torch.cuda.device(args.gpu):
-        model.load_state_dict(torch.load(model_dir + '/' + args.pretrained_from + '.pt',
-        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-    pre_model = copy.deepcopy(model)
-    for p in pre_model.parameters():
-        p.require_grad = False
-else:
-    pre_model = None
-
-# load the trained model (for resume)
-if args.load_from is not None:
-    with torch.cuda.device(args.gpu):
-        model.load_state_dict(torch.load(model_dir + '/' + args.load_from + '.pt',
-        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-
-if args.load_sampler_from is not None:
-    assert sampler is not None, 'only works on simultaneous translation'
-    with torch.cuda.device(args.gpu):
-        sampler.load_state_dict(torch.load(model_dir + '/' + args.load_sampler_from + '.pt',
-        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-
-if args.load_actor_from is not None:
-    assert actor is not None, 'only works on simultaneous translation'
-    with torch.cuda.device(args.gpu):
-        actor.load_state_dict(torch.load(model_dir + '/' + args.load_actor_from + '.pt',
-        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-
-
-# use cuda
-if args.gpu > -1:
-    model.cuda(args.gpu)
-
-    if pre_model is not None:
-        pre_model.cuda(args.gpu)
-
-    if sampler is not None:
-        sampler.cuda(args.gpu)
-
-    if actor is not None:
-        actor.cuda(args.gpu)
-
-
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
 
-# ----------------------------------------------------------------------------------------------------------------- #
 # tensorboard
 if args.tensorboard and (not args.debug):
     from tensorboardX import SummaryWriter
     writer = SummaryWriter('{}/{}'.format(run_dir, args.prefix + args.hp_str))
 else:
     writer = None
-    
+
+
+# -------------- build the model & run -----
+# for running the transformer:
 if not args.realtime:
+    
+    model = Transformer(SRG, TRG, args)
+    if args.load_from is not None:
+        with torch.cuda.device(args.gpu):
+            model.load_state_dict(torch.load(model_dir + '/' + args.load_from + '.pt',
+            map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+    if args.gpu > -1:
+        model.cuda(args.gpu)
+
     if args.mode == 'train':
         logger.info('starting training')
         train_model(args, model, train_real, dev_real, writer=writer)
@@ -336,9 +297,60 @@ if not args.realtime:
             teacher_model = None
         decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
 
+# for running the simultaneous transformer:
 else:
+    assert args.pretrained_from is not None, "we need to use a pretrained model to initialize"
+    
+    pre_model = SimultaneousTransformer(SRC, TRG, args)
+    with torch.cuda.device(args.gpu):
+        pre_model.load_state_dict(torch.load(model_dir + '/' + args.pretrained_from + '.pt',
+        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+    
+    model = copy.deepcopy(pre_model)
+    for p in pre_model.parameters():
+        p.require_grad = False
+    
+    sampler = GridSampler(args.d_model)
+    actor = Predictor(args.d_model)
+
+    # load the trained model (for resume)
+    if args.load_from is not None:
+        with torch.cuda.device(args.gpu):
+            model.load_state_dict(torch.load(model_dir + '/' + args.load_from + '.pt',
+            map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+    if args.load_sampler_from is not None:
+        with torch.cuda.device(args.gpu):
+            sampler.load_state_dict(torch.load(model_dir + '/' + args.load_sampler_from + '.pt',
+            map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+    if args.load_actor_from is not None:
+        with torch.cuda.device(args.gpu):
+            actor.load_state_dict(torch.load(model_dir + '/' + args.load_actor_from + '.pt',
+            map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+    # use cuda
+    if args.gpu > -1:
+        # if torch.cuda.device_count() > 1:
+        #     print("Let's use", torch.cuda.device_count(), "GPUs!")
+           
+        #     model = nn.DataParallel(model)
+        #     pre_model = nn.DataParallel(pre_model)
+        #     sampler = nn.DataParallel(sampler)
+        #     actor = nn.DataParallel(actor)
+
+        model.cuda(args.gpu)
+        pre_model.cuda(args.gpu)
+        sampler.cuda(args.gpu)
+        actor.cuda(args.gpu)
+
+
     if args.mode == 'train':
-        # q_step(args, model, sampler, train_real, dev_real, maxsteps=40000, writer=writer)
-        full_step(args, pre_model, model, actor, sampler, train_real, dev_real, writer)
+        # train_inference(args, model, sampler, train_real, dev_real, maxsteps=40000, writer=writer)
+        train(args, train_real, dev_real, pre_model, model, actor, sampler, writer)
+
+    else:
+
+        raise NotImplementedError
 
 logger.info("done.")
