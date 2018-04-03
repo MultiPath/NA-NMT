@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 python ez_run.py \
                 --prefix [time] \
-                --gpu 2 \
+                --gpu $1 \
                 --eval-every 500 \
                 --dataset iwslt \
                 --tensorboard \
@@ -10,6 +10,8 @@ python ez_run.py \
                 --use_wo \
                 --share_embeddings \
                 --causal_enc \
+                --src_add_eos \
+                
                 #--debug
                 #--params base-t2t \
                 #--fast --use_alignment --diag --positional_attention \

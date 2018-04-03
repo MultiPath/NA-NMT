@@ -1097,9 +1097,12 @@ class GridSampler(nn.Module):
 
     def trace_actions_beam(self, probs, masks, n=10):
         probs = probs.data
-        logprobs1 = -torch.log(probs + TINY).cpu().numpy() 
+        logprobs1 = -torch.log(probs + TINY).cpu().numpy()
         logprobs0 = -torch.log(1 - probs + TINY).cpu().numpy()
-        
+        # logprobs1 = -torch.log(probs * 0 + TINY).cpu().numpy()
+        # logprobs0 = -torch.log(1 - probs * 0+ TINY).cpu().numpy()
+
+
         B, Lx, Ly = probs.size()
         lens = Lx + Ly
         N = n

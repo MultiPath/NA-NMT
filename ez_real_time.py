@@ -63,6 +63,7 @@ def score_model(model,
     cost, loss = model.batched_cost(targets, target_masks, traj_decoder_probs, batched=True)
     return traj_decoder_out, traj_decoder_probs, cost, loss.view(B, N)
 
+
 def get_path_loss(probs, path_mask, samples, entropy_weight=0.0):
     losses = -(torch.log(probs + TINY) * (samples - entropy_weight * probs) + 
                torch.log((1 - probs) + TINY) * ((1 - samples) - entropy_weight * (1 - probs)))
@@ -169,7 +170,11 @@ def step(args, model, sampler=None, actor=None, pre_model=None,
         # run the model
         top_encoding = model.encoding(sources, source_masks)
         top_decoder_out = model(top_encoding, top_src_masks, top_inputs, top_input_masks, positions=Variable(top_traj_index.float()))
-        top_actor_probs = actor(top_decoder_out.detach())
+        
+        if args.detach_decoder:
+            top_actor_probs = actor(top_decoder_out.detach())
+        else:
+            top_actor_probs = actor(top_decoder_out)
         top_actor_loss = get_traj_loss(top_actor_probs[:, 1:], Variable(top_traj_mask[:, 1:]), Variable(top_traj[:, 1:])).mean()
 
         # void the possible loop
@@ -180,7 +185,6 @@ def step(args, model, sampler=None, actor=None, pre_model=None,
         # get the loss
         outputs['model_loss'] = top_model_loss
         outputs['actor_loss'] = top_actor_loss
-
 
     # visualization
     if print_out:
@@ -221,29 +225,6 @@ def decode_model(args, model, actor, batch, print_out=False):
         args.logger.info("===========================================================\n")
 
     return batch_size, delay, quality, strings[1], filtered_string
-
-
-# def q_actions(args, model, sampler, data, data_path):
-#     progressbar = tqdm(total=sum([1 for _ in data]), desc="start output R/W actions")
-#     model.eval()
-#     sampler.eval()
-
-#     output_f = open(data_path + '.Q1', 'w')
-#     for iters, batch in enumerate(data):
-#         outputs = scorer(args, model, sampler, batch, n=10, stochastic=False, print_out=False)
-#         indexs = outputs['reward'].sort(dim=-1, descending=True)[1][:, 0].data
-        
-#         # ranking based on reward
-#         for b in range(outputs['traj'].size(0)):
-#             action_seq = []
-#             for i in range(outputs['traj'].size(2)):
-#                 if (outputs['traj_mask'][b, indexs[b], i] > 0):
-#                     action_seq.append(str(int(outputs['traj'][b, indexs[b], i])))
-
-#             print(" ".join(action_seq))
-#         print('test decoding actions')
-#         break
-#     pass
 
 
 def train_inference(args, model, sampler, train, dev, save_path=None, maxsteps=None, writer=None):
@@ -335,9 +316,9 @@ def train_inference(args, model, sampler, train, dev, save_path=None, maxsteps=N
 def train(args, train, dev, pre_model, model, actor, sampler, writer=None):
     
     # optimizer
-    opt_sampler = torch.optim.Adam(sampler.parameters(), betas=(0.9, 0.98), eps=1e-9)
-    opt = torch.optim.Adam(list(model.parameters()) + list(actor.parameters()), lr=0.0001,
-                            betas=(0.9, 0.98), eps=1e-9)
+    opt_sampler = torch.optim.Adam(sampler.parameters(), betas=(0.9, 0.98), eps=1e-9, lr=0.001)
+    opt_actor = torch.optim.Adam(actor.parameters(), lr=0.001, betas=(0.9, 0.98), eps=1e-9)
+    opt_model = torch.optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
 
     # best = Best(max, 'reward', 'i', model=model, opt=opt, path=save_path, gpu=args.gpu)
     train_metrics_p = Metrics('train', 'loss', 'actor_loss', 'model_loss')
@@ -348,11 +329,13 @@ def train(args, train, dev, pre_model, model, actor, sampler, writer=None):
     # intervals
     p_steps = args.p_steps
     q_steps = args.q_steps
+    updates = 0
 
     for iters, batch in enumerate(train):
 
          # --- evaluation ---
         if iters % args.eval_every == 0:
+
             model.eval(); actor.eval()
             progressbar.close()
             dev_metrics.reset()
@@ -379,7 +362,7 @@ def train(args, train, dev, pre_model, model, actor, sampler, writer=None):
             if dev_metrics is not None:
                 args.logger.info(dev_metrics)
             args.logger.info("BLEU = {}".format(corpus_bleu))
-
+  
             # ---set-up a new progressor---
             progressbar = tqdm(total=args.eval_every, desc='start training.')
 
@@ -388,23 +371,26 @@ def train(args, train, dev, pre_model, model, actor, sampler, writer=None):
         if iters % (p_steps + q_steps) < q_steps:
             
             # training the inference networks (REINFORCE)
-           
+
 
             # --- training ---
             sampler.train(); pre_model.eval(); model.eval()
 
-            opt_sampler.zero_grad()
+            if iters % args.inter_size == 0:
+                opt_sampler.zero_grad()
+
             outputs = step(args, model, sampler, batch = batch, n=args.traj_size, stochastic=True)
             loss = outputs['loss']
-
+            loss = loss / args.inter_size
             train_metrics_q.accumulate(outputs['batch_size'], 
                                     outputs['loss'],
                                     outputs['reward'].mean(),
                                     outputs['quality'].mean(),
                                     outputs['delay'].mean())
-            
             loss.backward()
-            opt_sampler.step()
+
+            if iters % args.inter_size == (args.inter_size - 1):
+                opt_sampler.step()
 
             info = 'training step={}, loss={:.3f}, reward={:.3f}, quality={:.3f}, delay={:.3f}'.format(
                 iters, train_metrics_q.loss, train_metrics_q.reward, train_metrics_q.quality, train_metrics_q.delay)
@@ -415,24 +401,42 @@ def train(args, train, dev, pre_model, model, actor, sampler, writer=None):
         else:
 
             # training the model and the actor (Maximum Likelihood)
+            
 
             # --- training ---
             sampler.eval(); pre_model.eval(); model.train(); actor.train()
 
-            opt.zero_grad()
+            def get_learning_rate(i, lr0=0.1, disable=False):
+                if not disable:
+                    return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
+                return 0.0001
+            
+            if iters % args.inter_size == 0:
+                updates += 1
+                lr = get_learning_rate(updates, disable=args.disable_lr_schedule)
+                opt_model.param_groups[0]['lr'] = lr
+                # opt_actor.param_groups[0]['lr'] = lr
+
+                opt_model.zero_grad()
+                opt_actor.zero_grad()
+
+
             outputs = step(args, model, sampler, actor, pre_model, batch=batch, n=args.traj_size, stochastic=False, rescoring=False)  # only use beam-search
             loss = outputs['model_loss'] + outputs['actor_loss']
+            loss = loss / args.inter_size
+            train_metrics_p.accumulate(outputs['batch_size'], loss * args.traj_size, outputs['actor_loss'], outputs['model_loss'])
 
-            train_metrics_p.accumulate(outputs['batch_size'], 
-                                    loss,
-                                    outputs['actor_loss'],
-                                    outputs['model_loss'])
-
+                                    
             loss.backward()
-            opt.step()
 
-            info = 'training step={}, loss={:.3f}, actor_loss={:.3f}, model_loss={:.3f}'.format(
-                iters, train_metrics_p.loss, train_metrics_p.actor_loss, train_metrics_p.model_loss)
+            if iters % args.inter_size == (args.inter_size - 1):
+                opt_actor.step()
+
+                if not args.fix_model:
+                    opt_model.step()
+
+            info = 'training step={}, lr={:.6f}, loss={:.3f}, actor_loss={:.3f}, model_loss={:.3f}'.format(
+                iters, lr, train_metrics_p.loss, train_metrics_p.actor_loss, train_metrics_p.model_loss)
 
             progressbar.update(1)
             progressbar.set_description(info)

@@ -35,6 +35,7 @@ parser.add_argument('--load_vocab',   action='store_true', help='load a pre-comp
 parser.add_argument('--load_dataset', action='store_true', help='load a pre-processed dataset')
 parser.add_argument('--use_revtok',   action='store_true', help='use reversible tokenization')
 parser.add_argument('--remove_eos',   action='store_true', help='possibly remove <eos> tokens for FastTransformer')
+parser.add_argument('--src_add_eos',  action='store_true', help='add <eos> for source sentences. To help to decode <eos> in simultaneous translation')
 parser.add_argument('--test_set',     type=str, default=None,  help='which test set to use')
 parser.add_argument('--max_len',      type=int, default=None,  help='limit the train set sentences to this many tokens')
 
@@ -48,10 +49,13 @@ parser.add_argument('--pretrained_from', type=str, default=None, help='load from
 parser.add_argument('--load_sampler_from', type=str, default=None, help='load from a GridSampler checkpoint')
 parser.add_argument('--load_actor_from', type=str, default=None, help='load from a GridSampler checkpoint')
 parser.add_argument('--traj_size', type=int, default=10, help="sample size of trajectories")
+parser.add_argument('--inter_size', type=int, default=5, help="size for accumulating gradients")
 parser.add_argument('--delay_type', type=str, default="max")
 parser.add_argument('--delay_weight', type=float, default=0.2)
 parser.add_argument('--p_steps', type=int, default=100, help="alternating training, P steps")
 parser.add_argument('--q_steps', type=int, default=100, help="alternating training, Q steps")
+parser.add_argument('--detach_decoder', action='store_true', help='makes the actor not affect the decoder.')
+parser.add_argument('--fix_model', action='store_true', help='fix the NMT model and only train the actor.')
 
 # model ablation settings
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
@@ -146,6 +150,8 @@ torch.cuda.manual_seed_all(args.seed)
 DataField = data.ReversibleField if args.use_revtok else NormalField
 TRG   = DataField(init_token='<init>', eos_token='<eos>', batch_first=True)
 SRC   = DataField(batch_first=True) if not args.share_embeddings else TRG
+if args.src_add_eos:
+    SRC.eos_token = '<eos>'
 
 # setup many datasets (need to manaually setup)
 data_prefix = args.data_prefix
@@ -210,7 +216,11 @@ def dyn_batch_without_padding(new, i, sofar):
 if args.share_embeddings:
     SRC = copy.deepcopy(SRC)
     SRC.init_token = None
-    SRC.eos_token = None
+    if args.src_add_eos:
+        SRC.eos_token = '<eos>'
+    else:
+        SRC.eos_token = None
+
     train_data.fields['src'] = SRC
     dev_data.fields['src'] = SRC
 
@@ -249,7 +259,10 @@ args.__dict__.update(hparams)
 
 # ----------------------------------------------------------------------------------------------------------------- #
 # show the arg:
-logger.info(args)
+arg_str = "args:\n"
+for w in sorted(args.__dict__.keys()):
+    arg_str += "{}:\t{}\n".format(w, args.__dict__[w])
+logger.info(arg_str)
 
 hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
@@ -268,12 +281,11 @@ if args.tensorboard and (not args.debug):
 else:
     writer = None
 
-
 # -------------- build the model & run -----
 # for running the transformer:
 if not args.realtime:
     
-    model = Transformer(SRG, TRG, args)
+    model = Transformer(SRC, TRG, args)
     if args.load_from is not None:
         with torch.cuda.device(args.gpu):
             model.load_state_dict(torch.load(model_dir + '/' + args.load_from + '.pt',
@@ -302,33 +314,38 @@ else:
     assert args.pretrained_from is not None, "we need to use a pretrained model to initialize"
     
     pre_model = SimultaneousTransformer(SRC, TRG, args)
-    with torch.cuda.device(args.gpu):
-        pre_model.load_state_dict(torch.load(model_dir + '/' + args.pretrained_from + '.pt',
-        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-    
-    model = copy.deepcopy(pre_model)
-    for p in pre_model.parameters():
-        p.require_grad = False
-    
+    model = SimultaneousTransformer(SRC, TRG, args)
     sampler = GridSampler(args.d_model)
     actor = Predictor(args.d_model)
 
-    # load the trained model (for resume)
+    # load the trained model
+    logger.info("load pretrained: {}".format(args.pretrained_from))
+    with torch.cuda.device(args.gpu):
+        pre_model.load_state_dict(torch.load(model_dir + '/' + args.pretrained_from + '.pt',
+        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+    # model = copy.deepcopy(pre_model)
+    for p in pre_model.parameters():
+        p.require_grad = False
+
     if args.load_from is not None:
+        logger.info("load pretrained: {}".format(args.load_from))
         with torch.cuda.device(args.gpu):
             model.load_state_dict(torch.load(model_dir + '/' + args.load_from + '.pt',
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
     if args.load_sampler_from is not None:
+        logger.info("load pretrained: {}".format(args.load_sampler_from))
         with torch.cuda.device(args.gpu):
             sampler.load_state_dict(torch.load(model_dir + '/' + args.load_sampler_from + '.pt',
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
     if args.load_actor_from is not None:
+        logger.info("load pretrained: {}".format(args.load_actor_from))
         with torch.cuda.device(args.gpu):
             actor.load_state_dict(torch.load(model_dir + '/' + args.load_actor_from + '.pt',
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-
+  
     # use cuda
     if args.gpu > -1:
         # if torch.cuda.device_count() > 1:
