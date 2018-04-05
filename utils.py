@@ -158,7 +158,7 @@ class ParallelDataset(datasets.TranslationDataset):
             else:
                 examples = []
                 with ExitStack() as stack:
-                    files = [stack.enter_context(open(fname)) for fname in paths]
+                    files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
                     for lines in zip(*files):
                         lines = [line.strip() for line in lines]
                         if not any(line == '' for line in lines):

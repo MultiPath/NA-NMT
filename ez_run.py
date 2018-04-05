@@ -1,3 +1,4 @@
+# encoding: utf-8
 import torch
 import numpy as np
 from torchtext import data
@@ -9,6 +10,7 @@ import random
 import argparse
 import os
 import copy
+import sys
 
 from ez_train import train_model
 from decode import decode_model
@@ -16,16 +18,13 @@ from model import Transformer, FastTransformer, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
 
-# check the path
-for d in ['models', 'runs', 'logs']:
-    if not os.path.exists('./{}'.format(d)):
-        os.mkdir('./{}'.format(d))
 
 # all the hyper-parameters
 parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 
 # dataset settings
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
+parser.add_argument('--workspace_prefix', type=str, default='./')
 parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
 parser.add_argument('--language',    type=str, default='ende',  help='a combination of two language markers to show the language pair.')
 parser.add_argument('--data_group',  type=str, default=None,  help='dataset group')
@@ -53,6 +52,10 @@ parser.add_argument('--positional_attention', action='store_true', help='incorpo
 parser.add_argument('--mode',    type=str, default='train',  help='train, test or build')
 parser.add_argument('--gpu',     type=int, default=0,        help='GPU to use or -1 for CPU')
 parser.add_argument('--seed',    type=int, default=19920206, help='seed for randomness')
+
+# universal neural machine translation
+parser.add_argument('--universal', action='store_true', help='enable embedding sharing in the universal space')
+
 
 # training
 parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
@@ -92,6 +95,18 @@ args = parser.parse_args()
 if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.", gmtime())
 
+# check the path
+def build_path(prefix, name):
+    pathname = os.path.join(prefix, name)
+    if not os.path.exists(pathname):
+        os.mkdir(pathname)
+    return pathname
+
+model_dir = build_path(args.workspace_prefix, "models")
+run_dir = build_path(args.workspace_prefix, "runs")
+log_dir = build_path(args.workspace_prefix, "logs")
+
+
 # get the langauage pairs:
 args.src = args.language[:2]  # source language
 args.trg = args.language[2:]  # target language
@@ -119,13 +134,27 @@ torch.cuda.manual_seed_all(args.seed)
 
 
 # ----------------------------------------------------------------------------------------------------------------- #
+data_prefix = args.data_prefix
+
 # setup data-field
 DataField = data.ReversibleField if args.use_revtok else NormalField
 TRG   = DataField(init_token='<init>', eos_token='<eos>', batch_first=True)
 SRC   = DataField(batch_first=True) if not args.share_embeddings else TRG
 
+# load universal pretrained embedding
+if args.universal:
+    
+    U = torch.load(data_prefix + args.dataset + '/word_vec_tensor.pt')
+    V = torch.load(data_prefix + args.dataset + '/word_vec_trg_tensor.pt')
+    if args.gpu > -1:
+        U = U.cuda(args.gpu)
+        V = V.cuda(args.gpu)
+        
+    args.__dict__.update({'U': U, 'V': V})
+
 # setup many datasets (need to manaually setup)
-data_prefix = args.data_prefix
+logger.info('start loading the dataset')
+
 if args.dataset == 'iwslt':
     if args.test_set is None:
         args.test_set = 'IWSLT16.TED.tst2013'
@@ -145,8 +174,20 @@ if args.dataset == 'iwslt':
 
     decoding_path = data_prefix + 'iwslt/en-de/{}.en-de.bpe.new'
 
+elif "europarl" in args.dataset:
+    if args.test_set is None:
+        args.test_set = 'dev.tok'
+
+    working_path = data_prefix + "{}/{}-{}/".format(args.dataset, args.src, args.trg)
+    train_data, dev_data = ParallelDataset.splits(path=working_path, train='train.tok',
+        validation=args.test_set, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
+        load_dataset=args.load_dataset, prefix='ts')
+    decoding_path = working_path + '{}.' + args.src + '-' + args.trg + '.new'
+
 else:
     raise NotImplementedError
+
+logger.info('load dataset done..')
 
 # build vocabularies
 if args.load_vocab and os.path.exists(data_prefix + '{}/vocab{}_{}.pt'.format(
@@ -158,6 +199,9 @@ if args.load_vocab and os.path.exists(data_prefix + '{}/vocab{}_{}.pt'.format(
     SRC.vocab = src_vocab
     TRG.vocab = trg_vocab
 
+    logger.info('load done.')
+
+
 else:
 
     logger.info('save the vocabulary')
@@ -166,6 +210,7 @@ else:
     TRG.build_vocab(train_data, dev_data, max_size=50000)
     torch.save([SRC.vocab, TRG.vocab], data_prefix + '{}/vocab{}_{}.pt'.format(
         args.dataset, 'shared' if args.share_embeddings else '', '{}-{}'.format(args.src, args.trg)))
+
 args.__dict__.update({'trg_vocab': len(TRG.vocab), 'src_vocab': len(SRC.vocab)})
 
 # build alignments ---
