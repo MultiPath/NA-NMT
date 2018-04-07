@@ -107,6 +107,9 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     if save_path is None:
         save_path = args.model_name
 
+    args.eval_every *= args.inter_size
+
+
     best = Best(max, 'corpus_bleu', 'corpus_gleu', 'gleu', 'loss', 'i', model=model, opt=opt, path=save_path, gpu=args.gpu)
     train_metrics = Metrics('train', 'loss', 'real', 'fake')
     dev_metrics = Metrics('dev', 'loss', 'gleu', 'real_loss', 'fake_loss', 'distance', 'alter_loss', 'distance2', 'fertility_loss', 'corpus_gleu')
@@ -123,6 +126,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 torch.save(best.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
+
         # --- validation --- #
         if iters % args.eval_every == 0:
             progressbar.close()
@@ -137,10 +141,6 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
                 writer.add_scalar('dev/GLEU_corpus_', outputs_data['corpus_gleu'], iters)
                 writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], iters)
-
-                if args.distillation:
-                    writer.add_scalar('dev/GLEU_corpus_dis', outputs_course['corpus_gleu'], iters)
-                    writer.add_scalar('dev/BLEU_corpus_dis', outputs_course['corpus_bleu'], iters)
 
             if not args.debug:
                 best.accumulate(outputs_data['corpus_bleu'], outputs_data['corpus_gleu'], dev_metrics.gleu, dev_metrics.loss, iters)
@@ -166,8 +166,10 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             if not disable:
                 return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
             return 0.00002
-        opt.param_groups[0]['lr'] = get_learning_rate(iters + 1, disable=args.disable_lr_schedule)
-        opt.zero_grad()
+        
+        if iters % args.inter_size == 0:
+            opt.param_groups[0]['lr'] = get_learning_rate(iters / args.inter_size + 1, disable=args.disable_lr_schedule)
+            opt.zero_grad()
 
         # prepare the data
         inputs, input_masks, \
@@ -176,29 +178,19 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         encoding, batch_size = model.quick_prepare(batch, args.distillation)
         input_reorder, fertility_cost, decoder_inputs = None, None, inputs
 
-        #print(input_masks.size(), target_masks.size(), input_masks.sum())
-        if type(model) is FastTransformer:
-            batch_fer = batch.fer_dec if args.distillation else batch.fer
-            inputs, input_reorder, input_masks, fertility_cost = model.prepare_initial(encoding, sources, source_masks, input_masks, batch_fer)
-
-
         # Maximum Likelihood Training
-        loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks))
-        if hasattr(args, 'fertility') and args.fertility:
-            loss += fertility_cost
-
+        loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.inter_size
 
         # accmulate the training metrics
         train_metrics.accumulate(batch_size, loss, print_iter=None)
         train_metrics.reset()
 
         loss.backward()
-        opt.step()
+        
+        if iters % args.inter_size == (args.inter_size - 1):
+            opt.step()
 
-        info = 'training step={}, loss={:.3f}, lr={:.5f}'.format(iters, export(loss), opt.param_groups[0]['lr'])
-        if hasattr(args, 'fertility') and args.fertility:
-            info += '| RE:{:.3f}'.format(export(fertility_cost))
-
+        info = 'training step={}, loss={:.3f}, lr={:.8f}'.format(iters, export(loss * args.inter_size), opt.param_groups[0]['lr'])
         if args.tensorboard and (not args.debug):
             writer.add_scalar('train/Loss', export(loss), iters)
 

@@ -142,6 +142,8 @@ class TripleTranslationDataset(datasets.TranslationDataset):
 
         super(datasets.TranslationDataset, self).__init__(examples, fields, **kwargs)
 
+
+# -------- Data-Loader --------- #
 class ParallelDataset(datasets.TranslationDataset):
     """ Define a N-parallel dataset: supports abitriry numbers of input streams"""
 
@@ -163,10 +165,44 @@ class ParallelDataset(datasets.TranslationDataset):
                         lines = [line.strip() for line in lines]
                         if not any(line == '' for line in lines):
                             examples.append(data.Example.fromlist(lines, fields))
+                            
                 if load_dataset:
                     torch.save(examples, path + '.processed.{}.pt'.format(prefix))
 
         super(datasets.TranslationDataset, self).__init__(examples, fields, **kwargs)
+
+# --- Lazy Data-Loader ----------- --- #
+def lazy_reader(paths, fields):
+    with ExitStack() as stack:
+        files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
+        examples = []
+        for steps, lines in enumerate(zip(*files)):
+            lines = [line.strip() for line in lines]
+            if not any(line == '' for line in lines):
+                examples.append(lines)
+
+            if steps % 4096 == 4095:    # pre-read 4096 lines of the dataset
+                for example in examples:
+                    yield data.Example.fromlist(example, fields)
+                examples = []
+            steps += 1
+
+        for example in examples:
+            yield data.Example.fromlist(example, fields)
+        
+        examples = []
+
+class LazyParallelDataset(datasets.TranslationDataset):
+    """ Define a N-parallel dataset: supports abitriry numbers of input streams"""
+
+    def __init__(self, path=None, exts=None, fields=None,
+                load_dataset=False, prefix='', examples=None, **kwargs):
+
+        assert len(exts) == len(fields), 'N parallel dataset must match'
+        self.N = len(fields)
+        paths = tuple(os.path.expanduser(path + x) for x in exts)
+        super(datasets.TranslationDataset, self).__init__(lazy_reader(paths, fields), fields, **kwargs)
+
 
 class Metrics:
 

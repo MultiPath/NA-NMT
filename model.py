@@ -532,23 +532,43 @@ class Encoder(nn.Module):
 
     def __init__(self, field, args, causal=False):
         super().__init__()
-        if args.share_embeddings:
-            self.out = nn.Linear(args.d_model, len(field.vocab))
-        else:
-            self.embed = nn.Embedding(len(field.vocab), args.d_model)
+
+        self.out = nn.Linear(args.d_model, len(field.vocab))
+
+        if args.universal:
+            self.out.weight.data[4:, :].zero_()  # zero all non-special token-embeddings (they are bias)
+            self.uni_out = nn.Linear(args.d_model, args.V.size(0), bias=False)
+            self.A = nn.Linear(args.U.size(1), args.U.size(1), bias=False)
+            nn.init.eye(self.A.weight)
+
+            # not trainable
+            self.U = Variable(args.U)  # data
+            self.V = Variable(args.V)  # data
+            self.Freq = Variable(args.Freq)
+
         self.layers = nn.ModuleList(
             [EncoderLayer(args, causal) for i in range(args.n_layers)])
         self.dropout = nn.Dropout(args.drop_ratio)
         self.field = field
         self.d_model = args.d_model
         self.share_embeddings = args.share_embeddings
+        self.universal = args.universal
+
 
     def forward(self, x, mask=None):
-        if self.share_embeddings:
-            x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
+
+        if self.universal:
+            alpha = F.embedding(x, self.Freq[:, None])
+            u = F.embedding(x, self.U) @ self.A.weight @ (self.V.transpose(1, 0)) # batch-size x L x 300
+            p = F.softmax(u / 0.05, dim=-1) # temperature = 0.05
+            v = p @ self.uni_out.weight * math.sqrt(self.d_model)
         else:
-            x = self.embed(x)
-        x += positional_encodings_like(x)
+            alpha = 0
+            v = 0
+
+        x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
+        x = x + alpha * v  # two embeddings together
+        x = x + positional_encodings_like(x)
         encoding = [x]
 
         x = self.dropout(x)
@@ -984,6 +1004,20 @@ class Transformer(nn.Module):
         else:
             loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
         return self.apply_mask_cost(loss, decoder_masks, batched)
+
+
+class UniversalTransformer(Transformer):
+
+    def __init__(self, src, trg, args): 
+        super(Transformer, self).__init__()
+
+        self.encoder = Encoder(src, args)
+        self.decoder = Decoder(trg, args)
+        self.field = trg
+        self.share_embeddings = args.share_embeddings
+        if args.share_embeddings:
+            self.encoder.out.weight = self.decoder.out.weight
+
 
 
 class FastTransformer(Transformer):

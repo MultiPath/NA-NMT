@@ -12,8 +12,9 @@ python ez_run.py \
                 --inter_size 4 \
                 --use_wo \
                 --language roen \
-                --universal \
-                #--debug \
+                # --debug
+                # --universal \
+                # --debug \
                 # --load_dataset \
                 # --debug \
 

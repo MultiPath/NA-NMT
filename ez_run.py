@@ -14,8 +14,8 @@ import sys
 
 from ez_train import train_model
 from decode import decode_model
-from model import Transformer, FastTransformer, INF, TINY, softmax
-from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
+from model import Transformer, FastTransformer, UniversalTransformer, INF, TINY, softmax
+from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, LazyParallelDataset, merge_cache
 from time import gmtime, strftime
 
 
@@ -55,7 +55,7 @@ parser.add_argument('--seed',    type=int, default=19920206, help='seed for rand
 
 # universal neural machine translation
 parser.add_argument('--universal', action='store_true', help='enable embedding sharing in the universal space')
-
+parser.add_argument('--inter_size', type=int, default=1, help='hack: inorder to increase the batch-size.')
 
 # training
 parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
@@ -143,14 +143,21 @@ SRC   = DataField(batch_first=True) if not args.share_embeddings else TRG
 
 # load universal pretrained embedding
 if args.universal:
-    
     U = torch.load(data_prefix + args.dataset + '/word_vec_tensor.pt')
     V = torch.load(data_prefix + args.dataset + '/word_vec_trg_tensor.pt')
+    Freq = torch.load(data_prefix + args.dataset + '/freq_tensor.pt')[0]
+    
+    # simplest mask
+    Freq[:4] = 0
+    Freq[4:] = 1
+
     if args.gpu > -1:
         U = U.cuda(args.gpu)
         V = V.cuda(args.gpu)
+        Freq = Freq.cuda(args.gpu)
         
-    args.__dict__.update({'U': U, 'V': V})
+
+    args.__dict__.update({'U': U, 'V': V, 'Freq': Freq})
 
 # setup many datasets (need to manaually setup)
 logger.info('start loading the dataset')
@@ -179,9 +186,13 @@ elif "europarl" in args.dataset:
         args.test_set = 'dev.tok'
 
     working_path = data_prefix + "{}/{}-{}/".format(args.dataset, args.src, args.trg)
-    train_data, dev_data = ParallelDataset.splits(path=working_path, train='train.tok',
+    train_data, dev_data = LazyParallelDataset.splits(path=working_path, train='train.tok',
         validation=args.test_set, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
         load_dataset=args.load_dataset, prefix='ts')
+
+    # train_data, dev_data = ParallelDataset.splits(path=working_path, train='train.tok',
+    #     validation=args.test_set, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
+    #     load_dataset=args.load_dataset, prefix='ts')
     decoding_path = working_path + '{}.' + args.src + '-' + args.trg + '.new'
 
 else:
@@ -243,10 +254,12 @@ if args.batch_size == 1:  # speed-test: one sentence per batch.
 else:
     batch_size_fn = dyn_batch_without_padding
 
+
 train_real, dev_real = data.BucketIterator.splits(
-    (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), device=args.gpu,
+    (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), device=args.gpu, shuffle=False, 
     batch_size_fn=batch_size_fn, repeat=None if args.mode == 'train' else False)
 logger.info("build the dataset. done!")
+
 # ----------------------------------------------------------------------------------------------------------------- #
 
 # model hyper-params:
@@ -270,7 +283,7 @@ args.__dict__.update(hparams)
 
 # ----------------------------------------------------------------------------------------------------------------- #
 # show the arg:
-logger.info(args)
+
 
 hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
@@ -279,8 +292,12 @@ logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = './models/' + args.prefix + hp_str
 
 # build the model
-model = Transformer(SRC, TRG, args)
-logger.info(str(model))
+if not args.universal:
+    model = Transformer(SRC, TRG, args)
+else:
+    model = UniversalTransformer(SRC, TRG, args)
+
+# logger.info(str(model))
 if args.load_from is not None:
     with torch.cuda.device(args.gpu):
         model.load_state_dict(torch.load('./models/' + args.load_from + '.pt',
@@ -292,6 +309,13 @@ if args.gpu > -1:
 
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
+
+# show the arg:
+arg_str = "args:\n"
+for w in sorted(args.__dict__.keys()):
+    if (w is not "U") and (w is not "V") and (w is not "Freq"):
+        arg_str += "{}:\t{}\n".format(w, args.__dict__[w])
+logger.info(arg_str)
 
 # ----------------------------------------------------------------------------------------------------------------- #
 if args.mode == 'train':

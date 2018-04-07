@@ -9,10 +9,9 @@ def process():
     word_vec = torch.load('/data1/ywang/word_vec_v2.pt')[0]
     vec_tensor = torch.Tensor(len(vocab1.stoi), 300).zero_()
     for key, value in word_vec.items():
-#         print(value)
         vec_tensor[vocab1.stoi[key]] = torch.from_numpy(np.squeeze(value))
     torch.save(vec_tensor, '/data1/ywang/word_vec_tensor.pt')
-process()  
+
 
 def process_trg():
 
@@ -20,9 +19,11 @@ def process_trg():
     word_vec = torch.load('/data1/ywang/word_vec_v2.pt')[1]
     vec_tensor = torch.Tensor(len(vocab1.stoi), 300).zero_()
     for key, value in word_vec.items():
-#         print(value)
         vec_tensor[vocab1.stoi[key]] = torch.from_numpy(np.squeeze(value))
     torch.save(vec_tensor, '/data1/ywang/word_vec_trg_tensor.pt')
 
 
-process_trg()
+
+
+# process()  
+# process_trg()
