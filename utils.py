@@ -178,20 +178,20 @@ def lazy_reader(paths, fields):  # infinite dataloader
             files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
             examples = []
             for steps, lines in enumerate(zip(*files)):
-                print(steps)
                 lines = [line.strip() for line in lines]
                 if not any(line == '' for line in lines):
                     examples.append(lines)
 
-                if steps % 100 == 99:# 4096 == 4095:    # pre-read 4096 lines of the dataset
+                if steps % 4096 == 4095:    # pre-read 4096 lines of the dataset
                     for example in examples:
                         yield data.Example.fromlist(example, fields)
                     examples = []
 
             for example in examples:
                 yield data.Example.fromlist(example, fields)
-            raise StopIteration
+            # raise StopIteration
             examples = []
+
 
 def full_reader(paths, fields):
     with ExitStack() as stack:
