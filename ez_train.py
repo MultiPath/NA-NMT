@@ -118,7 +118,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     for iters, batch in enumerate(train):
 
         iters += offset
-
+        
         # --- saving --- #
         if iters % args.save_every == 0:
             args.logger.info('save (back-up) checkpoints at iter={}'.format(iters))
@@ -126,27 +126,28 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 torch.save(best.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
-
         # --- validation --- #
         if iters % args.eval_every == 0:
-            progressbar.close()
-            dev_metrics.reset()
+            for dev_iters, dev_batch in enumerate(dev):
 
-            if args.distillation:
-                outputs_course = valid_model(args, model, dev, dev_metrics, distillation=True)
+                progressbar.close()
+                dev_metrics.reset()
 
-            outputs_data = valid_model(args, model, dev, None if args.distillation else dev_metrics, print_out=True)
-            if args.tensorboard and (not args.debug):
-                writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, iters)
-                writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
-                writer.add_scalar('dev/GLEU_corpus_', outputs_data['corpus_gleu'], iters)
-                writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], iters)
+                if args.distillation:
+                    outputs_course = valid_model(args, model, dev, dev_metrics, distillation=True)
 
-            if not args.debug:
-                best.accumulate(outputs_data['corpus_bleu'], outputs_data['corpus_gleu'], dev_metrics.gleu, dev_metrics.loss, iters)
-                args.logger.info('the best model is achieved at {}, average greedy GLEU={}, corpus GLEU={}, corpus BLEU={}'.format(
-                    best.i, best.gleu, best.corpus_gleu, best.corpus_bleu))
-            args.logger.info('model:' + args.prefix + args.hp_str)
+                outputs_data = valid_model(args, model, dev, None if args.distillation else dev_metrics, print_out=True)
+                if args.tensorboard and (not args.debug):
+                    writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, iters)
+                    writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
+                    writer.add_scalar('dev/GLEU_corpus_', outputs_data['corpus_gleu'], iters)
+                    writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], iters)
+
+                if not args.debug:
+                    best.accumulate(outputs_data['corpus_bleu'], outputs_data['corpus_gleu'], dev_metrics.gleu, dev_metrics.loss, iters)
+                    args.logger.info('the best model is achieved at {}, average greedy GLEU={}, corpus GLEU={}, corpus BLEU={}'.format(
+                        best.i, best.gleu, best.corpus_gleu, best.corpus_bleu))
+                args.logger.info('model:' + args.prefix + args.hp_str)
 
             # ---set-up a new progressor---
             progressbar = tqdm(total=args.eval_every, desc='start training.')

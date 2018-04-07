@@ -171,37 +171,61 @@ class ParallelDataset(datasets.TranslationDataset):
 
         super(datasets.TranslationDataset, self).__init__(examples, fields, **kwargs)
 
-# --- Lazy Data-Loader ----------- --- #
-def lazy_reader(paths, fields):
+
+def lazy_reader(paths, fields):  # infinite dataloader
+    while True:
+        with ExitStack() as stack:
+            files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
+            examples = []
+            for steps, lines in enumerate(zip(*files)):
+                print(steps)
+                lines = [line.strip() for line in lines]
+                if not any(line == '' for line in lines):
+                    examples.append(lines)
+
+                if steps % 100 == 99:# 4096 == 4095:    # pre-read 4096 lines of the dataset
+                    for example in examples:
+                        yield data.Example.fromlist(example, fields)
+                    examples = []
+
+            for example in examples:
+                yield data.Example.fromlist(example, fields)
+            raise StopIteration
+            examples = []
+
+def full_reader(paths, fields):
     with ExitStack() as stack:
         files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
         examples = []
         for steps, lines in enumerate(zip(*files)):
             lines = [line.strip() for line in lines]
             if not any(line == '' for line in lines):
-                examples.append(lines)
+                examples.append(data.Example.fromlist(lines, fields))
+        return examples
 
-            if steps % 4096 == 4095:    # pre-read 4096 lines of the dataset
-                for example in examples:
-                    yield data.Example.fromlist(example, fields)
-                examples = []
-            steps += 1
-
-        for example in examples:
-            yield data.Example.fromlist(example, fields)
-        
-        examples = []
 
 class LazyParallelDataset(datasets.TranslationDataset):
     """ Define a N-parallel dataset: supports abitriry numbers of input streams"""
 
     def __init__(self, path=None, exts=None, fields=None,
-                load_dataset=False, prefix='', examples=None, **kwargs):
+                load_dataset=False, prefix='', examples=None, lazy=True, **kwargs):
 
         assert len(exts) == len(fields), 'N parallel dataset must match'
         self.N = len(fields)
         paths = tuple(os.path.expanduser(path + x) for x in exts)
-        super(datasets.TranslationDataset, self).__init__(lazy_reader(paths, fields), fields, **kwargs)
+
+        if lazy:
+            super(datasets.TranslationDataset, self).__init__(lazy_reader(paths, fields), fields, **kwargs)
+        else:
+            super(datasets.TranslationDataset, self).__init__(full_reader(paths, fields), fields, **kwargs)
+
+    @classmethod
+    def splits(cls, path, train=None, validation=None, test=None, **kwargs):
+        train_data = None if train is None else cls(path + train, lazy=True, **kwargs)
+        val_data = None if validation is None else cls(path + validation, lazy=False, **kwargs)
+        test_data = None if test is None else cls(path + test, lazy=False, **kwargs)
+        return tuple(d for d in (train_data, val_data, test_data) if d is not None)
+        
 
 
 class Metrics:
