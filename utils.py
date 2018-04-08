@@ -69,7 +69,12 @@ class NormalField(data.Field):
         with torch.cuda.device_of(batch):
             batch = batch.tolist()
 
-        batch = [[self.vocab.itos[ind] for ind in ex] for ex in batch] # denumericalize
+        def detagging(s):
+            if (len(s) > 3) and (s[-3] == '_') and (s[-2:].isupper()):
+                return s[:-3]
+            return s
+
+        batch = [[detagging(self.vocab.itos[ind]) for ind in ex] for ex in batch] # denumericalize
 
         def trim(s, t):
             sentence = []

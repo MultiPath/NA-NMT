@@ -1018,6 +1018,9 @@ class UniversalTransformer(Transformer):
         if args.share_embeddings:
             self.encoder.out.weight = self.decoder.out.weight
 
+        if args.share_universal_embedding:
+            assert args.universal, "only works for universal neural machine translation"
+            self.encoder.uni_out.weight = self.decoder.out.weight
 
 
 class FastTransformer(Transformer):

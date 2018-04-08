@@ -56,6 +56,7 @@ parser.add_argument('--seed',    type=int, default=19920206, help='seed for rand
 # universal neural machine translation
 parser.add_argument('--universal', action='store_true', help='enable embedding sharing in the universal space')
 parser.add_argument('--inter_size', type=int, default=1, help='hack: inorder to increase the batch-size.')
+parser.add_argument('--share_universal_embedding', action='store_true', help='share the embedding matrix with target. Currently only supports English.')
 
 # training
 parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
@@ -147,7 +148,7 @@ if args.universal:
     V = torch.load(data_prefix + args.dataset + '/word_vec_trg_tensor.pt')
     Freq = torch.load(data_prefix + args.dataset + '/freq_tensor.pt')[0]
     
-    # simplest mask
+    # simplest mask (not using frequency in the current stage.)
     Freq[:4] = 0
     Freq[4:] = 1
 
@@ -157,7 +158,7 @@ if args.universal:
         Freq = Freq.cuda(args.gpu)
         
 
-    args.__dict__.update({'U': U, 'V': V, 'Freq': Freq})
+    args.__dict__.update({'U': U, 'V': V, 'Freq': Freq, 'unitok_size': V.size(0)})
 
 # setup many datasets (need to manaually setup)
 logger.info('start loading the dataset')
