@@ -553,7 +553,7 @@ class Encoder(nn.Module):
         self.d_model = args.d_model
         self.share_embeddings = args.share_embeddings
         self.universal = args.universal
-
+        self.universal_options = args.universal_options
 
     def forward(self, x, mask=None):
 
@@ -565,6 +565,11 @@ class Encoder(nn.Module):
         else:
             alpha = 0
             v = 0
+
+        if self.universal_options == 'no_use_universal':
+            alpha = alpha * 0  # directly disabled the universal tokens.
+        if self.universal_options == 'no_update_universal':
+            v = v.detach()
 
         x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
         x = x + alpha * v  # two embeddings together

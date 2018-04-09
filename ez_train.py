@@ -114,6 +114,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     train_metrics = Metrics('train', 'loss', 'real', 'fake')
     dev_metrics = Metrics('dev', 'loss', 'gleu', 'real_loss', 'fake_loss', 'distance', 'alter_loss', 'distance2', 'fertility_loss', 'corpus_gleu')
     progressbar = tqdm(total=args.eval_every, desc='start training.')
+    examples = 0
+    first_step = True
 
     for iters, batch in enumerate(train):
 
@@ -127,7 +129,15 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if iters % args.eval_every == 0:
+        if ((args.eval_every_examples == -1) and (iters % args.eval_every == 0)) \
+            or ((args.eval_every_examples > 0) and (examples > args.eval_every_examples)) \
+            or first_step:
+
+            first_step = False
+
+            if args.eval_every_examples > 0:
+                examples = examples % args.eval_every_examples
+
             for dev_iters, dev_batch in enumerate(dev):
 
                 progressbar.close()
@@ -179,6 +189,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         encoding, batch_size = model.quick_prepare(batch, args.distillation)
         input_reorder, fertility_cost, decoder_inputs = None, None, inputs
 
+        examples += batch_size
+
         # Maximum Likelihood Training
         loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.inter_size
 
@@ -189,6 +201,14 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         loss.backward()
         
         if iters % args.inter_size == (args.inter_size - 1):
+
+            if args.universal_options == 'no_update_encdec':
+                for p in model.parameters():
+                    if p is not model.encoder.out.weight:
+                        if p.grad is not None:
+                            p.grad.detach_()
+                            p.grad.zero_()
+
             opt.step()
 
         info = 'training step={}, loss={:.3f}, lr={:.8f}'.format(iters, export(loss * args.inter_size), opt.param_groups[0]['lr'])

@@ -57,9 +57,13 @@ parser.add_argument('--seed',    type=int, default=19920206, help='seed for rand
 parser.add_argument('--universal', action='store_true', help='enable embedding sharing in the universal space')
 parser.add_argument('--inter_size', type=int, default=1, help='hack: inorder to increase the batch-size.')
 parser.add_argument('--share_universal_embedding', action='store_true', help='share the embedding matrix with target. Currently only supports English.')
+parser.add_argument('--finetune', action='store_true', help='add an action as finetuning. used for RO dataset.')
+parser.add_argument('--universal_options', default='all', const='all', nargs='?',
+                    choices=['no_use_universal', 'no_update_universal', 'no_update_encdec', 'all'], help='list servers, storage, or both (default: %(default)s)')
 
 # training
 parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
+parser.add_argument('--eval-every-examples', type=int, default=-1, help='alternative to eval every (batches)')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
 parser.add_argument('--batch_size',    type=int, default=2048,    help='# of tokens processed per batch')
@@ -185,9 +189,13 @@ if args.dataset == 'iwslt':
 elif "europarl" in args.dataset:
     if args.test_set is None:
         args.test_set = 'dev.tok'
+    if args.finetune:
+        train_set = 'finetune.tok'
+    else:
+        train_set = 'train.tok'
 
     working_path = data_prefix + "{}/{}-{}/".format(args.dataset, args.src, args.trg)
-    train_data, dev_data = LazyParallelDataset.splits(path=working_path, train='train.tok',
+    train_data, dev_data = LazyParallelDataset.splits(path=working_path, train=train_set,
         validation=args.test_set, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
         load_dataset=args.load_dataset, prefix='ts')
 
