@@ -16,7 +16,7 @@ python ez_run.py \
                 --load_from "04.08_20.40.europarl0_subword_512_512_6_8_0.100_16000_" \
                 --resume \
                 --finetune \
-                --universal_option "no_update_encdec" \
+                --universal_option "no_update_self" \
                 # --debug
                 # --debug \
                 # --load_dataset \

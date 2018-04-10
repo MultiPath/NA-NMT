@@ -572,6 +572,10 @@ class Encoder(nn.Module):
             v = v.detach()
 
         x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
+        if self.universal_options == 'no_update_self':
+            x = x.detach()
+            v = v.detach()
+
         x = x + alpha * v  # two embeddings together
         x = x + positional_encodings_like(x)
         encoding = [x]

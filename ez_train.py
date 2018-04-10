@@ -204,7 +204,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             if args.universal_options == 'no_update_encdec':
                 for p in model.parameters():
-                    if p is not model.encoder.out.weight:
+                    if p is not model.encoder.uni_out.weight:
                         if p.grad is not None:
                             p.grad.detach_()
                             p.grad.zero_()

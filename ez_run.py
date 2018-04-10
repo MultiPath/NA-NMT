@@ -59,7 +59,7 @@ parser.add_argument('--inter_size', type=int, default=1, help='hack: inorder to 
 parser.add_argument('--share_universal_embedding', action='store_true', help='share the embedding matrix with target. Currently only supports English.')
 parser.add_argument('--finetune', action='store_true', help='add an action as finetuning. used for RO dataset.')
 parser.add_argument('--universal_options', default='all', const='all', nargs='?',
-                    choices=['no_use_universal', 'no_update_universal', 'no_update_encdec', 'all'], help='list servers, storage, or both (default: %(default)s)')
+                    choices=['no_use_universal', 'no_update_universal', 'no_update_self', 'no_update_encdec', 'all'], help='list servers, storage, or both (default: %(default)s)')
 
 # training
 parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
