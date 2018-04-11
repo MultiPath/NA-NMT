@@ -5,7 +5,7 @@ from torch.autograd import Variable, Function
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 import math
-
+from collections import OrderedDict
 from utils import computeGLEU, masked_sort, unsorted
 
 INF = 1e10
@@ -1031,6 +1031,44 @@ class UniversalTransformer(Transformer):
             assert args.universal, "only works for universal neural machine translation"
             self.encoder.uni_out.weight = self.decoder.out.weight
 
+    def get_parameters(self, meta=False):
+        params = []
+        if meta:
+            for module in [self.encoder.layers, self.encoder.uni_out, self.encoder.A, self.decoder]:
+                params += list(module.parameters())
+        else:
+            for module in [self.encoder.layers, self.encoder.out, self.decoder]:
+                params += list(module.parameters())
+        return params
+        
+    def save_self_parameters(self, meta_param=None):
+        named_params = [OrderedDict(), OrderedDict()]
+        for name, param in self.encoder.layers.named_parameters():
+            if meta_param is not None:
+                named_params[0][name] = param.data - meta_param[0][name]  # save the delta of parameters
+            else:
+                named_params[0][name] = param.data
+
+        for name, param in self.decoder.named_parameters():
+            if meta_param is not None:
+                named_params[1][name] = param.data - meta_param[1][name]  # save the delta of parameters
+            else:
+                named_params[1][name] = param.data
+
+        return named_params
+
+    def load_self_parameters(self, named_params, meta_param=None):
+        for name, param in self.encoder.layers.named_parameters():
+            if meta_param is not None:
+                param.data.copy_(named_params[0][name] + meta_param[0][name])
+            else:
+                param.data.copy_(named_params[0][name])
+
+        for name, param in self.decoder.named_parameters():
+            if meta_param is not None:
+                param.data.copy_(named_params[1][name] + meta_param[1][name])
+            else:
+                param.data.copy_(named_params[1][name])
 
 class FastTransformer(Transformer):
 

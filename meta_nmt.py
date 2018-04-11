@@ -11,12 +11,16 @@ import argparse
 import os
 import copy
 import sys
+import math
 
-from ez_train import train_model
+from ez_train import export
 from decode import decode_model
 from model import Transformer, UniversalTransformer, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, LazyParallelDataset, merge_cache
+from utils import Metrics, Best, computeGLEU, computeBLEU
 from time import gmtime, strftime
+from tqdm import tqdm, trange
+from torch.autograd import Variable
 
 
 # all the hyper-parameters
@@ -25,12 +29,12 @@ parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 # dataset settings
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
 parser.add_argument('--workspace_prefix', type=str, default='./')
-parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
-parser.add_argument('--language',    type=str, default='ende',  help='a combination of two language markers to show the language pair.')
-parser.add_argument('--data_group',  type=str, default=None,  help='dataset group')
+parser.add_argument('--dataset',     type=str, default='iwslt', help='"the name of dataset"')
+parser.add_argument('-s', '--src',  type=str, default='ro',  help='meta-testing target language.')
+parser.add_argument('-t', '--trg',  type=str, default='en',  help='meta-testing target language.')
+parser.add_argument('-a', '--aux', nargs='+', type=str,  default='es it pt fr',  help='meta-testing target language.')
 
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
-parser.add_argument('--load_dataset', action='store_true', help='load a pre-processed dataset')
 parser.add_argument('--use_revtok',   action='store_true', help='use reversible tokenization')
 parser.add_argument('--remove_eos',   action='store_true', help='possibly remove <eos> tokens for FastTransformer')
 parser.add_argument('--test_set',     type=str, default=None,  help='which test set to use')
@@ -60,10 +64,11 @@ parser.add_argument('--share_universal_embedding', action='store_true', help='sh
 parser.add_argument('--finetune', action='store_true', help='add an action as finetuning. used for RO dataset.')
 parser.add_argument('--universal_options', default='all', const='all', nargs='?',
                     choices=['no_use_universal', 'no_update_universal', 'no_update_self', 'no_update_encdec', 'all'], help='list servers, storage, or both (default: %(default)s)')
+parser.add_argument('--meta_learning', action='store_true', help='meta-learning for low resource neural machine translation')
 
 # training
-
 parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
+parser.add_argument('--meta-eval-every', type=int, default=32,   help='every ** words for one meta-update (for default 160k)')
 parser.add_argument('--eval-every-examples', type=int, default=-1, help='alternative to eval every (batches)')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
@@ -102,27 +107,25 @@ if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.", gmtime())
 
 # check the path
-def build_path(prefix, name):
+def build_path(args, name):
+    prefix = args.workspace_prefix
     pathname = os.path.join(prefix, name)
     if not os.path.exists(pathname):
         os.mkdir(pathname)
+    args.__dict__.update({name + "_dir": pathname})
     return pathname
 
-model_dir = build_path(args.workspace_prefix, "models")
-run_dir = build_path(args.workspace_prefix, "runs")
-log_dir = build_path(args.workspace_prefix, "logs")
+build_path(args, "models")
+build_path(args, "runs")
+build_path(args, "logs")
 
-
-# get the langauage pairs:
-args.src = args.language[:2]  # source language
-args.trg = args.language[2:]  # target language
 
 # setup logger settings
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-fh = logging.FileHandler('./logs/log-{}.txt'.format(args.prefix))
+fh = logging.FileHandler('{}/log-{}.txt'.format(args.logs_dir, args.prefix))
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(formatter)
 ch = logging.StreamHandler()
@@ -143,7 +146,7 @@ torch.cuda.manual_seed_all(args.seed)
 data_prefix = args.data_prefix
 
 # setup data-field
-DataField = data.ReversibleField if args.use_revtok else NormalField
+DataField = NormalField
 TRG   = DataField(init_token='<init>', eos_token='<eos>', batch_first=True)
 SRC   = DataField(batch_first=True) if not args.share_embeddings else TRG
 
@@ -162,47 +165,22 @@ if args.universal:
         V = V.cuda(args.gpu)
         Freq = Freq.cuda(args.gpu)
         
-
     args.__dict__.update({'U': U, 'V': V, 'Freq': Freq, 'unitok_size': V.size(0)})
 
-# setup many datasets (need to manaually setup)
+# setup many datasets (need to manaually setup --- Meta-Learning settings.
 logger.info('start loading the dataset')
 
-if args.dataset == 'iwslt':
-    if args.test_set is None:
-        args.test_set = 'IWSLT16.TED.tst2013'
-
-    if args.data_group == 'test':
-        train_data, dev_data = NormalTranslationDataset.splits(
-        path=data_prefix + 'iwslt/en-de/', train='train.tags.en-de.bpe',
-        validation='{}.en-de.bpe'.format(args.test_set), exts=('.{}'.format(args.src), '.{}'.format(args.trg)),
-        fields=(SRC, TRG), load_dataset=args.load_dataset, prefix='normal')
-
-    else:  # default dataset
-        train_data, dev_data = ParallelDataset.splits(
-        path=data_prefix + 'iwslt/en-de/', train='train.tags.en-de.bpe',
-        validation='train.tags.en-de.bpe.dev', exts=('.en2', '.de2'),
-        fields=[('src', SRC), ('trg', TRG)],
-        load_dataset=args.load_dataset, prefix='ts')
-
-    decoding_path = data_prefix + 'iwslt/en-de/{}.en-de.bpe.new'
-
-elif "europarl" in args.dataset:
-    if args.test_set is None:
-        args.test_set = 'dev.tok'
-    if args.finetune:
-        train_set = 'finetune.tok'
-    else:
-        train_set = 'train.tok'
-
+if "europarl" in args.dataset:
     working_path = data_prefix + "{}/{}-{}/".format(args.dataset, args.src, args.trg)
-    train_data, dev_data = LazyParallelDataset.splits(path=working_path, train=train_set,
-        validation=args.test_set, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
-        load_dataset=args.load_dataset, prefix='ts')
 
-    # train_data, dev_data = ParallelDataset.splits(path=working_path, train='train.tok',
-    #     validation=args.test_set, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
-    #     load_dataset=args.load_dataset, prefix='ts')
+    test_set = 'dev.tok'
+    train_set = 'finetune.tok'
+
+    train_data, dev_data = LazyParallelDataset.splits(path=working_path, train=train_set,
+        validation=test_set, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)])
+
+    aux_data = [LazyParallelDataset(path=working_path + dataset, exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)], lazy=True)
+                for dataset in args.aux]
     decoding_path = working_path + '{}.' + args.src + '-' + args.trg + '.new'
 
 else:
@@ -210,31 +188,20 @@ else:
 
 logger.info('load dataset done..')
 
+
 # build vocabularies
-if args.load_vocab and os.path.exists(data_prefix + '{}/vocab{}_{}.pt'.format(
-        args.dataset, 'shared' if args.share_embeddings else '', '{}-{}'.format(args.src, args.trg))):
+assert args.load_vocab and os.path.exists(data_prefix + '{}/vocab_{}.pt'.format(
+        args.dataset, '{}-{}'.format(args.src, args.trg))), "meta-learning only works for pre-built vocabulary"
 
-    logger.info('load saved vocabulary.')
-    src_vocab, trg_vocab = torch.load(data_prefix + '{}/vocab{}_{}.pt'.format(
-        args.dataset, 'shared' if args.share_embeddings else '', '{}-{}'.format(args.src, args.trg)))
-    SRC.vocab = src_vocab
-    TRG.vocab = trg_vocab
-
-    logger.info('load done.')
-
-
-else:
-
-    logger.info('save the vocabulary')
-    if not args.share_embeddings:
-        SRC.build_vocab(train_data, dev_data, max_size=50000)
-    TRG.build_vocab(train_data, dev_data, max_size=50000)
-    torch.save([SRC.vocab, TRG.vocab], data_prefix + '{}/vocab{}_{}.pt'.format(
-        args.dataset, 'shared' if args.share_embeddings else '', '{}-{}'.format(args.src, args.trg)))
+logger.info('load saved vocabulary.')
+src_vocab, trg_vocab = torch.load(data_prefix + '{}/vocab_{}.pt'.format(args.dataset, '{}-{}'.format(args.src, args.trg)))
+SRC.vocab = src_vocab
+TRG.vocab = trg_vocab
+logger.info('load done.')
 
 args.__dict__.update({'trg_vocab': len(TRG.vocab), 'src_vocab': len(SRC.vocab)})
 
-# build alignments ---
+# build dynamic batching ---
 def dyn_batch_with_padding(new, i, sofar):
     prev_max_len = sofar / (i - 1) if i > 1 else 0
     if args.distillation:
@@ -248,16 +215,6 @@ def dyn_batch_without_padding(new, i, sofar):
     else:
         return sofar + max(len(new.src), len(new.trg))
 
-# work around torchtext making it hard to share vocabs without sharing other field properties
-if args.share_embeddings:
-    SRC = copy.deepcopy(SRC)
-    SRC.init_token = None
-    SRC.eos_token = None
-    train_data.fields['src'] = SRC
-    dev_data.fields['src'] = SRC
-
-if args.max_len is not None:
-    train_data.examples = [ex for ex in train_data.examples if len(ex.trg) <= args.max_len]
 
 if args.batch_size == 1:  # speed-test: one sentence per batch.
     batch_size_fn = lambda new, count, sofar: count
@@ -268,49 +225,34 @@ else:
 train_real, dev_real = data.BucketIterator.splits(
     (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), device=args.gpu, shuffle=False, 
     batch_size_fn=batch_size_fn, repeat=None if args.mode == 'train' else False)
+aux_reals = [data.BucketIterator(dataset, batch_size=args.batch_size, device=args.gpu, train=True, batch_size_fn=batch_size_fn, shuffle=False)
+            for dataset in aux_data]
 logger.info("build the dataset. done!")
 
+
 # ----------------------------------------------------------------------------------------------------------------- #
-
 # model hyper-params:
-hparams = None
-if args.dataset == 'iwslt':
-    if args.params == 'james-iwslt':
-        hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
-                    'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
-    elif args.params == 'james-iwslt2':
-        hparams = {'d_model': 278, 'd_hidden': 2048, 'n_layers': 5,
-                    'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
-    teacher_hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
-                    'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746}
-
-
-if hparams is None:
-    logger.info('use default parameters of t2t-base')
-    hparams = {'d_model': 512, 'd_hidden': 512, 'n_layers': 6,
-                'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 16000} # ~32
+logger.info('use default parameters of t2t-base')
+hparams = {'d_model': 512, 'd_hidden': 512, 'n_layers': 6,
+            'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 16000} # ~32
 args.__dict__.update(hparams)
 
 # ----------------------------------------------------------------------------------------------------------------- #
 # show the arg:
 
-
 hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
-        f"{args.drop_ratio:.3f}_{args.warmup}_{'uni_' if args.causal_enc else ''}")
+        f"{args.drop_ratio:.3f}_{args.warmup}_{'universal_' if args.universal else ''}_meta")
 logger.info(f'Starting with HPARAMS: {hp_str}')
-model_name = './models/' + args.prefix + hp_str
+model_name = args.models_dir + '/' + args.prefix + hp_str
 
 # build the model
-if not args.universal:
-    model = Transformer(SRC, TRG, args)
-else:
-    model = UniversalTransformer(SRC, TRG, args)
+model = UniversalTransformer(SRC, TRG, args)
 
 # logger.info(str(model))
 if args.load_from is not None:
     with torch.cuda.device(args.gpu):
-        model.load_state_dict(torch.load('./models/' + args.load_from + '.pt',
+        model.load_state_dict(torch.load(args.models_dir + '/' + args.load_from + '.pt',
         map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
 # use cuda
@@ -320,6 +262,11 @@ if args.gpu > -1:
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
 
+# tensorboard writer
+if args.tensorboard and (not args.debug):
+    from tensorboardX import SummaryWriter
+    writer = SummaryWriter('{}/{}'.format(args.runs_dir, args.prefix + args.hp_str))
+
 # show the arg:
 arg_str = "args:\n"
 for w in sorted(args.__dict__.keys()):
@@ -328,19 +275,90 @@ for w in sorted(args.__dict__.keys()):
 logger.info(arg_str)
 
 # ----------------------------------------------------------------------------------------------------------------- #
-if args.mode == 'train':
-    logger.info('starting training')
-    train_model(args, model, train_real, dev_real)
+#
+# Starting Meta-Learning for Low-Resource Neural Machine Transaltion
+#
+# ----------------------------------------------------------------------------------------------------------------- #
 
-elif args.mode == 'test':
-    logger.info('starting decoding from the pre-trained model, on the test set...')
-    name_suffix = '{}_b={}_model_{}.txt'.format(args.decode_mode, args.beam_size, args.load_from)
-    names = ['src.{}'.format(name_suffix), 'trg.{}'.format(name_suffix),'dec.{}'.format(name_suffix)]
+# optimizer
+if args.optimizer == 'Adam':
+    meta_opt = torch.optim.Adam([p for p in model.get_parameters(meta=True) if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
+else:
+    raise NotImplementedError
 
-    if args.model is FastTransformer:
-        names += ['fer.{}'.format(name_suffix)]
-    if args.rerank_by_bleu:
-        teacher_model = None
-    decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
+# ---- updates ------
+args.eval_every *= args.inter_size
+args.meta_eval_every *= args.inter_size
 
-logger.info("done.")
+iters = 0
+
+# ---- outer-loop ---
+while True:
+    model.train()
+    def get_learning_rate(i, lr0=0.1, disable=False):
+        if not disable:
+            return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
+        return 0.00002 
+    lr0 = get_learning_rate(iters / args.inter_size + 1)
+
+    # saving the checkpoint #
+    if iters % args.save_every == 0:
+        pass
+    
+    # ----- inner-loop ------
+    meta_param = copy.deepcopy(model.save_self_parameters())  # in case the data has been changed...
+    self_params = []
+    for j in range(len(aux_data)):
+        progressbar = tqdm(total=args.meta_eval_every, desc='start training for {}'.format(args.aux[j]))
+
+        # reset the optimizer
+        model.load_self_parameters(meta_param)
+        self_opt = torch.optim.Adam([p for p in model.get_parameters(meta=False) if p.requires_grad], betas=(0.9, 0.98), eps=1e-9, lr=lr0)
+        for i, train_batch in enumerate(aux_reals[j]):
+            if i % args.inter_size == 0:
+                self_opt.param_groups[0]['lr'] = get_learning_rate(iters + i / args.inter_size + 1, disable=args.disable_lr_schedule)
+                self_opt.zero_grad()
+            
+            inputs, input_masks, targets, target_masks, sources, source_masks, encoding, batch_size = model.quick_prepare(train_batch)
+            loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.inter_size
+            loss.backward()
+
+            if i % args.inter_size == (args.inter_size - 1):
+                self_opt.step()
+
+            info = '     Inner-loop[{}]: training step={}, loss={:.3f}, lr={:.8f}'.format(args.aux[j], i, export(loss * args.inter_size), self_opt.param_groups[0]['lr'])
+            progressbar.update(1)
+            progressbar.set_description(info)
+
+            if i == args.meta_eval_every:
+                break
+        progressbar.close()
+        self_params.append(model.save_self_parameters(meta_param=meta_param))   # save the increamentals
+    
+    # ------ outer-loop -------
+    progressbar = tqdm(total=args.meta_eval_every, desc='start training for {}'.format(args.aux[j]))
+    for k in range(args.meta_eval_every):
+        meta_opt.param_groups[0]['lr'] = get_learning_rate(iters + k + 1, disable=args.disable_lr_schedule)
+        loss_outer = 0
+        for j in range(len(aux_data)):
+            meta_train_batch = next(iter(aux_reals[j]))
+            model.load_self_parameters(self_params[j], meta_param)
+            inputs, input_masks, targets, target_masks, sources, source_masks, encoding, batch_size = model.quick_prepare(meta_train_batch)
+            
+            loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / len(aux_data)
+            loss.backward()   
+            loss_outer = loss_outer + loss
+        
+        # update the meta-parameters
+        model.load_self_parameters(meta_param)
+        meta_opt.step()
+        meta_param = copy.deepcopy(model.save_self_parameters())
+
+        info = 'Outer-loop (all): training step={}, loss={:.3f}, lr={:.8f}'.format(iters + k, export(loss_outer), self_opt.param_groups[0]['lr'])
+        progressbar.update(1)
+        progressbar.set_description(info)
+    progressbar.close()
+    
+    iters = iters + args.meta_eval_every
+    print('done')
+    break
