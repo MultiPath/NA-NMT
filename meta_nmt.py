@@ -357,8 +357,12 @@ while True:
         info = 'Outer-loop (all): training step={}, loss={:.3f}, lr={:.8f}'.format(iters + k, export(loss_outer), self_opt.param_groups[0]['lr'])
         progressbar.update(1)
         progressbar.set_description(info)
-    progressbar.close()
     
+    progressbar.close()
+
+    # ---- zero the self-embedding matrix
+    model.encoder.out.weight.data[4:, :].zero_() # ignore the first special tokens.
+
     iters = iters + args.meta_eval_every
     print('done')
     break
