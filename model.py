@@ -101,14 +101,15 @@ def demask(inputs, the_mask):
 
 # F.softmax has strange default behavior, normalizing over dim 0 for 3D inputs
 def softmax(x):
-    if x.dim() == 3:
-        return F.softmax(x.transpose(0, 2)).transpose(0, 2)
-    return F.softmax(x)
+    return F.softmax(x, dim=-1)
+    # if x.dim() == 3:
+    #     return F.softmax(x.transpose(0, 2)).transpose(0, 2)
+    # return F.softmax(x)
 
 def log_softmax(x):
-    if x.dim() == 3:
-        return F.log_softmax(x.transpose(0, 2)).transpose(0, 2)
-    return F.log_softmax(x)
+    # if x.dim() == 3:
+    #     return F.log_softmax(x.transpose(0, 2)).transpose(0, 2)
+    return F.log_softmax(x, dim=-1)
 
 def logsumexp(x, dim=-1):
     x_max = x.max(dim, keepdim=True)[0]
@@ -1041,34 +1042,34 @@ class UniversalTransformer(Transformer):
                 params += list(module.parameters())
         return params
         
-    def save_self_parameters(self, meta_param=None):
-        named_params = [OrderedDict(), OrderedDict()]
+    def save_fast_weights(self, weights=None):
+        fast_weights = [OrderedDict(), OrderedDict()]
         for name, param in self.encoder.layers.named_parameters():
-            if meta_param is not None:
-                named_params[0][name] = param.data - meta_param[0][name]  # save the delta of parameters
+            if weights is not None:
+                fast_weights[0][name] = param.data - weights[0][name]  # save the delta of parameters
             else:
-                named_params[0][name] = param.data
+                fast_weights[0][name] = param.data
 
         for name, param in self.decoder.named_parameters():
-            if meta_param is not None:
-                named_params[1][name] = param.data - meta_param[1][name]  # save the delta of parameters
+            if weights is not None:
+                fast_weights[1][name] = param.data - weights[1][name]  # save the delta of parameters
             else:
-                named_params[1][name] = param.data
+                fast_weights[1][name] = param.data
 
-        return named_params
+        return fast_weights
 
-    def load_self_parameters(self, named_params, meta_param=None):
+    def load_fast_weights(self, fast_weights, weights=None):
         for name, param in self.encoder.layers.named_parameters():
-            if meta_param is not None:
-                param.data.copy_(named_params[0][name] + meta_param[0][name])
+            if weights is not None:
+                param.data.copy_(fast_weights[0][name] + weights[0][name])
             else:
-                param.data.copy_(named_params[0][name])
+                param.data.copy_(fast_weights[0][name])
 
         for name, param in self.decoder.named_parameters():
-            if meta_param is not None:
-                param.data.copy_(named_params[1][name] + meta_param[1][name])
+            if weights is not None:
+                param.data.copy_(fast_weights[1][name] + weights[1][name])
             else:
-                param.data.copy_(named_params[1][name])
+                param.data.copy_(fast_weights[1][name])
 
 class FastTransformer(Transformer):
 

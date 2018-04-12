@@ -12,8 +12,9 @@ import os
 import copy
 import sys
 import math
+import time
 
-from ez_train import export
+from ez_train import export, valid_model
 from decode import decode_model
 from model import Transformer, UniversalTransformer, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, LazyParallelDataset, merge_cache
@@ -29,9 +30,9 @@ parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 # dataset settings
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
 parser.add_argument('--workspace_prefix', type=str, default='./')
-parser.add_argument('--dataset',     type=str, default='iwslt', help='"the name of dataset"')
-parser.add_argument('-s', '--src',  type=str, default='ro',  help='meta-testing target language.')
-parser.add_argument('-t', '--trg',  type=str, default='en',  help='meta-testing target language.')
+parser.add_argument('--dataset',   type=str, default='iwslt', help='"the name of dataset"')
+parser.add_argument('-s', '--src', type=str, default='ro',  help='meta-testing target language.')
+parser.add_argument('-t', '--trg', type=str, default='en',  help='meta-testing target language.')
 parser.add_argument('-a', '--aux', nargs='+', type=str,  default='es it pt fr',  help='meta-testing target language.')
 
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
@@ -66,12 +67,14 @@ parser.add_argument('--universal_options', default='all', const='all', nargs='?'
                     choices=['no_use_universal', 'no_update_universal', 'no_update_self', 'no_update_encdec', 'all'], help='list servers, storage, or both (default: %(default)s)')
 parser.add_argument('--meta_learning', action='store_true', help='meta-learning for low resource neural machine translation')
 
-# training
-parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
-parser.add_argument('--meta-eval-every', type=int, default=32,   help='every ** words for one meta-update (for default 160k)')
+# meta-learning 
+parser.add_argument('--valid_steps',   type=int, default=5,        help='repeating training for 5 epoches')
+parser.add_argument('--inner_steps',   type=int, default=32,       help='every ** words for one meta-update (for default 160k)')
+parser.add_argument('--outer_steps',   type=int, default=32,       help='every ** words for one meta-update (for default 160k)')
+parser.add_argument('--eval-every',    type=int, default=1024,     help='run dev every')
 parser.add_argument('--eval-every-examples', type=int, default=-1, help='alternative to eval every (batches)')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
-parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
+parser.add_argument('--maximum_steps', type=int, default=2000000, help='maximum steps you take to train a model')
 parser.add_argument('--batch_size',    type=int, default=2048,    help='# of tokens processed per batch')
 parser.add_argument('--optimizer',     type=str, default='Adam')
 parser.add_argument('--disable_lr_schedule', action='store_true', help='disable the transformer-style learning rate')
@@ -260,12 +263,14 @@ if args.gpu > -1:
     model.cuda(args.gpu)
 
 # additional information
-args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
+args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger,  'n_lang': len(args.aux)})
 
 # tensorboard writer
 if args.tensorboard and (not args.debug):
     from tensorboardX import SummaryWriter
     writer = SummaryWriter('{}/{}'.format(args.runs_dir, args.prefix + args.hp_str))
+else:
+    writer = None
 
 # show the arg:
 arg_str = "args:\n"
@@ -286,75 +291,126 @@ if args.optimizer == 'Adam':
 else:
     raise NotImplementedError
 
-# ---- updates ------
-args.eval_every *= args.inter_size
-args.meta_eval_every *= args.inter_size
-
+# ---- updates ------ #
 iters = 0
+def get_learning_rate(i, lr0=0.1, disable=False):
+    if not disable:
+        return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
+    return 0.00002
 
-# ---- outer-loop ---
-while True:
+
+def inner_loop(args, data, model, weights, iters=0, save_diff=True):
     model.train()
-    def get_learning_rate(i, lr0=0.1, disable=False):
-        if not disable:
-            return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
-        return 0.00002 
-    lr0 = get_learning_rate(iters / args.inter_size + 1)
+    data_loader, data_name = data
+    progressbar = tqdm(total=args.inner_steps, desc='start training for {}'.format(data_name))
 
-    # saving the checkpoint #
-    if iters % args.save_every == 0:
-        pass
-    
-    # ----- inner-loop ------
-    meta_param = copy.deepcopy(model.save_self_parameters())  # in case the data has been changed...
-    self_params = []
-    for j in range(len(aux_data)):
-        progressbar = tqdm(total=args.meta_eval_every, desc='start training for {}'.format(args.aux[j]))
-
-        # reset the optimizer
-        model.load_self_parameters(meta_param)
-        self_opt = torch.optim.Adam([p for p in model.get_parameters(meta=False) if p.requires_grad], betas=(0.9, 0.98), eps=1e-9, lr=lr0)
-        for i, train_batch in enumerate(aux_reals[j]):
-            if i % args.inter_size == 0:
-                self_opt.param_groups[0]['lr'] = get_learning_rate(iters + i / args.inter_size + 1, disable=args.disable_lr_schedule)
-                self_opt.zero_grad()
-            
+    # reset the optimizer
+    model.load_fast_weights(weights)
+    self_opt = torch.optim.Adam([p for p in model.get_parameters(meta=False) if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
+    for i in range(args.inner_steps):                                                                                                
+        self_opt.param_groups[0]['lr'] = get_learning_rate(iters + i + 1, disable=args.disable_lr_schedule)
+        self_opt.zero_grad()
+        loss_inner = 0
+        for j in range(args.inter_size):
+            train_batch = next(iter(data_loader))
             inputs, input_masks, targets, target_masks, sources, source_masks, encoding, batch_size = model.quick_prepare(train_batch)
             loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.inter_size
             loss.backward()
 
-            if i % args.inter_size == (args.inter_size - 1):
-                self_opt.step()
+            loss_inner = loss_inner + loss
 
-            info = '     Inner-loop[{}]: training step={}, loss={:.3f}, lr={:.8f}'.format(args.aux[j], i, export(loss * args.inter_size), self_opt.param_groups[0]['lr'])
-            progressbar.update(1)
-            progressbar.set_description(info)
+        # update the fast-weights
+        self_opt.step()
+        info = '  Inner-loop[{}]: training step={}, loss={:.3f}, lr={:.8f}'.format(data_name, i + 1, export(loss_inner), self_opt.param_groups[0]['lr'])
+        progressbar.update(1)
+        progressbar.set_description(info)
 
-            if i == args.meta_eval_every:
-                break
-        progressbar.close()
-        self_params.append(model.save_self_parameters(meta_param=meta_param))   # save the increamentals
+    progressbar.close()
+
+    if save_diff:
+        return model.save_fast_weights(weights=weights)  # fast-weights
+    return model.save_fast_weights()
+
+# training start..
+best = Best(max, 'corpus_bleu', 'corpus_gleu', 'gleu', 'loss', 'i', model=model, opt=meta_opt, path=args.model_name, gpu=args.gpu)
+train_metrics = Metrics('train', 'loss', 'real', 'fake')
+dev_metrics = Metrics('dev', 'loss', 'gleu', 'real_loss', 'fake_loss', 'distance', 'alter_loss', 'distance2', 'fertility_loss', 'corpus_gleu')
+eposides = 0
+
+while True:
+    time0 = time.time()
+
+    # ----- saving the checkpoint ----- #
+    if iters % args.save_every == 0:
+        args.logger.info('save (back-up) checkpoints at iter={}'.format(iters))
+        with torch.cuda.device(args.gpu):
+            torch.save(best.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
+            torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
+       
+    # ----- meta-validation ----- #
+    if iters % args.eval_every == (args.eval_every - 1):
+        dev_iters = iters
+        weights = copy.deepcopy(model.save_fast_weights())  # --- initial params
+        fast_weights = weights
+        
+        for j in range(args.valid_steps):
+            args.logger.info("Fine-tuning step: {}".format(j))
+            dev_metrics.reset()
+
+            fast_weights = inner_loop(args, (train_real, "ro"), model, fast_weights, dev_iters, save_diff=False)
+            output_data = valid_model(args, model, dev_real, dev_metrics, print_out=True)
+
+            if args.tensorboard and (not args.debug):
+                writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, dev_iters)
+                writer.add_scalar('dev/Loss', dev_metrics.loss, dev_iters)
+                writer.add_scalar('dev/GLEU_corpus_', outputs_data['corpus_gleu'], dev_iters)
+                writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], dev_iters)
+
+            if not args.debug:
+                best.accumulate(outputs_data['corpus_bleu'], outputs_data['corpus_gleu'], dev_metrics.gleu, dev_metrics.loss, dev_iters)
+                args.logger.info('the best model is achieved at {}, average greedy GLEU={}, corpus GLEU={}, corpus BLEU={}'.format(
+                    best.i, best.gleu, best.corpus_gleu, best.corpus_bleu))
+            args.logger.info('model:' + args.prefix + args.hp_str)
+            dev_iters += args.inner_steps
+
+        model.load_fast_weights(weights)  # --- comming back to normal
+
+    # ----- meta-training ------- #
+    model.train()
+    if iters > args.maximum_steps:
+        args.logger.info('reach the maximum updating steps.')
+        break
+
+    # ----- inner-loop ------
+    weights = copy.deepcopy(model.save_fast_weights())  # in case the data has been changed...
+    all_fast_weights = []
+    for j in range(args.n_lang):
+        fast_weights = inner_loop(args, (aux_reals[j], args.aux[j]), model, weights, iters = iters)
+        all_fast_weights.append(fast_weights)   # save the increamentals
     
-    # ------ outer-loop -------
-    progressbar = tqdm(total=args.meta_eval_every, desc='start training for {}'.format(args.aux[j]))
-    for k in range(args.meta_eval_every):
+    # ------ outer-loop -----
+    progressbar = tqdm(total=args.outer_steps, desc='start training for {}'.format(args.aux[j]))
+    for k in range(args.outer_steps):
         meta_opt.param_groups[0]['lr'] = get_learning_rate(iters + k + 1, disable=args.disable_lr_schedule)
+        meta_opt.zero_grad()
         loss_outer = 0
-        for j in range(len(aux_data)):
+        for j in range(args.n_lang):
             meta_train_batch = next(iter(aux_reals[j]))
-            model.load_self_parameters(self_params[j], meta_param)
+            model.load_fast_weights(all_fast_weights[j], weights)
             inputs, input_masks, targets, target_masks, sources, source_masks, encoding, batch_size = model.quick_prepare(meta_train_batch)
-            
-            loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / len(aux_data)
+            loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.n_lang
             loss.backward()   
             loss_outer = loss_outer + loss
         
         # update the meta-parameters
-        model.load_self_parameters(meta_param)
+        model.load_fast_weights(weights)
         meta_opt.step()
-        meta_param = copy.deepcopy(model.save_self_parameters())
+        weights = copy.deepcopy(model.save_fast_weights())
 
-        info = 'Outer-loop (all): training step={}, loss={:.3f}, lr={:.8f}'.format(iters + k, export(loss_outer), self_opt.param_groups[0]['lr'])
+        info = 'Outer-loop (all): training step={}, loss={:.3f}, lr={:.8f}'.format(iters + k + 1, export(loss_outer), meta_opt.param_groups[0]['lr'])
+        if args.tensorboard and (not args.debug):
+            writer.add_scalar('train/Loss', export(loss_outer), iters + k)
+        
         progressbar.update(1)
         progressbar.set_description(info)
     
@@ -363,6 +419,8 @@ while True:
     # ---- zero the self-embedding matrix
     model.encoder.out.weight.data[4:, :].zero_() # ignore the first special tokens.
 
-    iters = iters + args.meta_eval_every
-    print('done')
-    break
+    iters = iters + args.outer_steps
+    eposides = eposides + 1
+    args.logger.info("Training eposide {} ends with: {}s\n".format(eposides, time.time() - time0))
+
+args.logger.info('Done.')

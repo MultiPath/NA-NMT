@@ -35,6 +35,7 @@ def valid_model(args, model, dev, dev_metrics=None, distillation=False, print_ou
     outputs = {}
 
     model.eval()
+    progressbar = tqdm(total=len([1 for _ in dev]), desc='start decoding for validation...')
 
     for j, dev_batch in enumerate(dev):
         inputs, input_masks, \
@@ -56,7 +57,7 @@ def valid_model(args, model, dev, dev_metrics=None, distillation=False, print_ou
         dev_outputs = [model.output_decoding(d) for d in  dev_outputs]
         gleu = computeGLEU(dev_outputs[2], dev_outputs[1], corpus=False, tokenizer=tokenizer)
 
-        if print_out:
+        if (print_out and (j < 5)):
             for k, d in enumerate(dev_outputs):
                 args.logger.info("{}: {}".format(print_seqs[k], d[0]))
             args.logger.info('------------------------------------------------------------------')
@@ -69,6 +70,12 @@ def valid_model(args, model, dev, dev_metrics=None, distillation=False, print_ou
             if fertility_cost is not None:
                 values += [fertility_cost]
             dev_metrics.accumulate(batch_size, *values)
+
+        info = 'Validation: decoding step={}, gleu={:.3f}'.format(j + 1, export(gleu.mean()))
+        progressbar.update(1)
+        progressbar.set_description(info)
+    
+    progressbar.close()
 
     corpus_gleu = computeGLEU(dec_outputs, trg_outputs, corpus=True, tokenizer=tokenizer)
     corpus_bleu = computeBLEU(dec_outputs, trg_outputs, corpus=True, tokenizer=tokenizer)
