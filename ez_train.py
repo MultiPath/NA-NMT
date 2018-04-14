@@ -93,7 +93,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
     if args.tensorboard and (not args.debug):
         from tensorboardX import SummaryWriter
-        writer = SummaryWriter('./runs/{}'.format(args.prefix+args.hp_str))
+        writer = SummaryWriter('/data0/workspace/unitrans2/runs/{}'.format(args.prefix+args.hp_str))
 
     # optimizer
     if args.optimizer == 'Adam':
@@ -123,6 +123,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     progressbar = tqdm(total=args.eval_every, desc='start training.')
     examples = 0
     first_step = True
+    loss_outer = 0
 
     for iters, batch in enumerate(train):
 
@@ -134,6 +135,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             with torch.cuda.device(args.gpu):
                 torch.save(best.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
+
 
         # --- validation --- #
         if ((args.eval_every_examples == -1) and (iters % args.eval_every == 0)) \
@@ -155,13 +157,14 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
                 outputs_data = valid_model(args, model, dev, None if args.distillation else dev_metrics, print_out=True)
                 if args.tensorboard and (not args.debug):
-                    writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, iters)
-                    writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
-                    writer.add_scalar('dev/GLEU_corpus_', outputs_data['corpus_gleu'], iters)
-                    writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], iters)
+                    writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, iters / args.inter_size)
+                    writer.add_scalar('dev/Loss', dev_metrics.loss, iters / args.inter_size)
+                    writer.add_scalar('dev/GLEU_corpus_', outputs_data['corpus_gleu'], iters / args.inter_size)
+                    writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], iters / args.inter_size)
+
 
                 if not args.debug:
-                    best.accumulate(outputs_data['corpus_bleu'], outputs_data['corpus_gleu'], dev_metrics.gleu, dev_metrics.loss, iters)
+                    best.accumulate(outputs_data['corpus_bleu'], outputs_data['corpus_gleu'], dev_metrics.gleu, dev_metrics.loss, iters / args.inter_size)
                     args.logger.info('the best model is achieved at {}, average greedy GLEU={}, corpus GLEU={}, corpus BLEU={}'.format(
                         best.i, best.gleu, best.corpus_gleu, best.corpus_bleu))
                 args.logger.info('model:' + args.prefix + args.hp_str)
@@ -188,6 +191,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         if iters % args.inter_size == 0:
             opt.param_groups[0]['lr'] = get_learning_rate(iters / args.inter_size + 1, disable=args.disable_lr_schedule)
             opt.zero_grad()
+            loss_outer = 0
 
         # prepare the data
         inputs, input_masks, \
@@ -200,6 +204,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
         # Maximum Likelihood Training
         loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.inter_size
+        loss_outer = loss_outer + loss
 
         # accmulate the training metrics
         train_metrics.accumulate(batch_size, loss, print_iter=None)
@@ -218,11 +223,9 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             opt.step()
 
-        info = 'training step={}, loss={:.3f}, lr={:.8f}'.format(iters, export(loss * args.inter_size), opt.param_groups[0]['lr'])
-        if args.tensorboard and (not args.debug):
-            writer.add_scalar('train/Loss', export(loss), iters)
+            info = 'training step={}, loss={:.3f}, lr={:.8f}'.format(iters / args.inter_size, export(loss_outer), opt.param_groups[0]['lr'])
+            if args.tensorboard and (not args.debug):
+                writer.add_scalar('train/Loss', export(loss_outer), iters / args.inter_size)
 
-        progressbar.update(1)
-        progressbar.set_description(info)
-
-
+            progressbar.update(1)
+            progressbar.set_description(info)
