@@ -294,7 +294,10 @@ if args.no_meta_training:
     meta_opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
 else:  # meta-model only updates meta-parameters
     meta_opt = torch.optim.Adam([p for p in model.get_parameters(meta=True) if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
-    
+
+# for p in meta_opt.param_groups[0]['params']:
+#     print(p.size())
+# 1/0
  # if resume training
 if (args.load_from is not None) and (args.resume):
     with torch.cuda.device(args.gpu):   # very important.
@@ -368,7 +371,7 @@ while True:
             torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
        
     # ----- meta-validation ----- #
-    if iters % args.eval_every == 0:
+    if False: #iters % args.eval_every == 0:
         dev_iters = iters
         with torch.cuda.device(args.gpu):
             weights = copy.deepcopy(model.save_fast_weights())  # --- initial params
@@ -394,7 +397,7 @@ while True:
             fast_weights = inner_loop(args, (train_real, "ro"), model, fast_weights, dev_iters, save_diff=False, self_opt=self_opt)
             outputs_data = valid_model(args, model, dev_real, dev_metrics, print_out=True)
             dev_iters += args.inner_steps
-            
+
             if args.tensorboard and (not args.debug):
                 writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, dev_iters)
                 writer.add_scalar('dev/Loss', dev_metrics.loss, dev_iters)
@@ -447,8 +450,13 @@ while True:
     progressbar = tqdm(total=args.outer_steps, desc='start training')
     
     for k in range(args.outer_steps):
-        meta_opt.param_groups[0]['lr'] = get_learning_rate(iters + k + 1, disable=args.disable_lr_schedule)
+        meta_opt.param_groups[0]['lr'] = get_learning_rate(iters + k + 1, disable=args.disable_lr_schedule) * 100000
         meta_opt.zero_grad()
+        g = 0
+        for p in model.encoder.uni_out.parameters():
+            print((p.grad.data ** 2).sum())
+
+        
         loss_outer = 0
         bs_outter = 0
 
@@ -478,8 +486,24 @@ while True:
 
         # update the meta-parameters
         if not args.no_meta_training:
+            g = 0
+            for p in model.encoder.uni_out.parameters():
+                print((p.data ** 2).sum())
+            g = 0
+            for p in model.encoder.uni_out.parameters():
+                print((p.grad.data ** 2).sum())
             model.load_fast_weights(weights)
+            g = 0
+            for p in model.encoder.uni_out.parameters():
+                print((p.grad.data ** 2).sum())
+            
             meta_opt.step()
+            g = 0
+            for p in model.encoder.uni_out.parameters():
+                print((p.data ** 2).sum())
+            
+            1/0
+            
             with torch.cuda.device(args.gpu):
                 weights = copy.deepcopy(model.save_fast_weights())
         else:

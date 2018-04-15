@@ -567,15 +567,15 @@ class Encoder(nn.Module):
             alpha = 0
             v = 0
 
-        # if self.universal_options == 'no_use_universal':
-        #     alpha = alpha * 0  # directly disabled the universal tokens.
-        # if self.universal_options == 'no_update_universal':
-        #     v = v.detach()
+        if self.universal_options == 'no_use_universal':
+            alpha = alpha * 0  # directly disabled the universal tokens.
+        if self.universal_options == 'no_update_universal':
+            v = v.detach()
 
         x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
-        # if self.universal_options == 'no_update_self':
-        #     x = x.detach()
-        #     v = v.detach()
+        if self.universal_options == 'no_update_self':
+            x = x.detach()
+            v = v.detach()
 
         x = x + alpha * v  # two embeddings together
         x = x + positional_encodings_like(x)

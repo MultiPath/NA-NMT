@@ -58,6 +58,7 @@ parser.add_argument('--universal', action='store_true', help='enable embedding s
 parser.add_argument('--inter_size', type=int, default=1, help='hack: inorder to increase the batch-size.')
 parser.add_argument('--share_universal_embedding', action='store_true', help='share the embedding matrix with target. Currently only supports English.')
 parser.add_argument('--finetune', action='store_true', help='add an action as finetuning. used for RO dataset.')
+parser.add_argument('--finetune_dataset',  type=str, default=None)
 parser.add_argument('--universal_options', default='all', const='all', nargs='?',
                     choices=['no_use_universal', 'no_update_universal', 'no_update_self', 'no_update_encdec', 'all'], help='list servers, storage, or both (default: %(default)s)')
 
@@ -101,15 +102,20 @@ if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.", gmtime())
 
 # check the path
-def build_path(prefix, name):
+if not os.path.exists(args.workspace_prefix):
+    os.mkdir(args.workspace_prefix)
+
+def build_path(args, name):
+    prefix = args.workspace_prefix
     pathname = os.path.join(prefix, name)
     if not os.path.exists(pathname):
         os.mkdir(pathname)
+    args.__dict__.update({name + "_dir": pathname})
     return pathname
 
-model_dir = build_path(args.workspace_prefix, "models")
-run_dir = build_path(args.workspace_prefix, "runs")
-log_dir = build_path(args.workspace_prefix, "logs")
+build_path(args, "models")
+build_path(args, "runs")
+build_path(args, "logs")
 
 
 # get the langauage pairs:
@@ -189,8 +195,12 @@ if args.dataset == 'iwslt':
 elif "europarl" in args.dataset:
     if args.test_set is None:
         args.test_set = 'dev.tok'
+    
     if args.finetune:
-        train_set = 'finetune.tok'
+        if args.finetune_dataset is None:
+            train_set = 'finetune.tok'
+        else:
+            train_set = args.finetune_dataset
     else:
         train_set = 'train.tok'
 
@@ -261,7 +271,7 @@ if args.max_len is not None:
 if args.batch_size == 1:  # speed-test: one sentence per batch.
     batch_size_fn = lambda new, count, sofar: count
 else:
-    batch_size_fn = dyn_batch_without_padding
+    batch_size_fn = dyn_batch_with_padding # dyn_batch_without_padding
 
 
 train_real, dev_real = data.BucketIterator.splits(
@@ -298,7 +308,7 @@ hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
         f"{args.drop_ratio:.3f}_{args.warmup}_{'uni_' if args.causal_enc else ''}")
 logger.info(f'Starting with HPARAMS: {hp_str}')
-model_name = './models/' + args.prefix + hp_str
+model_name = args.models_dir + '/' + args.prefix + hp_str
 
 # build the model
 if not args.universal:
@@ -309,8 +319,9 @@ else:
 # logger.info(str(model))
 if args.load_from is not None:
     with torch.cuda.device(args.gpu):
-        model.load_state_dict(torch.load('./models/' + args.load_from + '.pt',
+        model.load_state_dict(torch.load(args.models_dir + '/' + args.load_from + '.pt',
         map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
 
 # use cuda
 if args.gpu > -1:
@@ -326,10 +337,14 @@ for w in sorted(args.__dict__.keys()):
         arg_str += "{}:\t{}\n".format(w, args.__dict__[w])
 logger.info(arg_str)
 
+if args.tensorboard and (not args.debug):
+    from tensorboardX import SummaryWriter
+    writer = SummaryWriter('{}/{}'.format(args.runs_prefix, args.prefix + args.hp_str))
+
 # ----------------------------------------------------------------------------------------------------------------- #
 if args.mode == 'train':
     logger.info('starting training')
-    train_model(args, model, train_real, dev_real)
+    train_model(args, model, train_real, dev_real, writer=writer)
 
 elif args.mode == 'test':
     logger.info('starting decoding from the pre-trained model, on the test set...')
