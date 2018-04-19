@@ -253,7 +253,7 @@ args.__dict__.update(hparams)
 
 hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
-        f"{args.drop_ratio:.3f}_{args.warmup}_{'universal_' if args.universal else ''}_meta")
+        f"{args.drop_ratio:.3f}_{args.warmup}_{'universal_' if args.universal else ''}_meta{'_seq' if args.sequential_learning else ''}")
 logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = args.models_dir + '/' + args.prefix + hp_str
 
@@ -317,11 +317,15 @@ def get_learning_rate(i, lr0=0.1, disable=False):
     return 0.00002
 
 
-def inner_loop(args, data, model, weights, iters=0, save_diff=True, self_opt=None):
+def inner_loop(args, data, model, weights, iters=0, save_diff=True, self_opt=None, progressbar=None):
     model.train()
     data_loader, data_name = data
-    progressbar = tqdm(total=args.inner_steps, desc='start training for {}'.format(data_name))
+    flag = True
 
+    if progressbar is None:
+        flag = False
+        progressbar = tqdm(total=args.inner_steps, desc='start training for {}'.format(data_name))
+    
     model.load_fast_weights(weights)
     with torch.cuda.device(args.gpu):
         slow_weights = copy.deepcopy(model.save_fast_weights(type='slow'))  # --- universal embeddings are not updated, but accumurated.
@@ -360,7 +364,9 @@ def inner_loop(args, data, model, weights, iters=0, save_diff=True, self_opt=Non
         # slow weights remain normal
         model.load_fast_weights(slow_weights, type='slow')
 
-    progressbar.close()
+    if not flag:
+        progressbar.close()
+
     if save_diff:
         diff_weights = model.save_fast_weights(weights=weights)
         diff_weights.update(diff_slow_weights)
@@ -372,6 +378,10 @@ def inner_loop(args, data, model, weights, iters=0, save_diff=True, self_opt=Non
 best = Best(max, 'corpus_bleu', 'corpus_gleu', 'i', model=model, opt=meta_opt, path=args.model_name, gpu=args.gpu)
 train_metrics = Metrics('train', 'loss', 'real', 'fake')
 dev_metrics = Metrics('dev', 'loss', 'gleu', 'real_loss', 'fake_loss', 'distance', 'alter_loss', 'distance2', 'fertility_loss', 'corpus_gleu')
+
+# ------ outer-loop -----
+eval_steps = args.eval_every if args.sequential_learning else args.eval_every * args.n_lang
+progressbar = tqdm(total=eval_steps , desc='start training')
 
 while True:
 
@@ -438,6 +448,9 @@ while True:
         model.load_fast_weights(weights)         # --- comming back to normal
         model.encoder.out.load_state_dict(outs)  # --- comming back to normal
 
+        progressbar.close()
+        progressbar = tqdm(total=eval_steps , desc='start training')
+
     # ----- meta-training ------- #
     model.train()
     if iters > args.maximum_steps:
@@ -453,7 +466,7 @@ while True:
     
     all_fast_weights = []
     for j in languages:
-        fast_weights = inner_loop(args, (aux_reals[j], args.aux[j]), model, weights, iters = iters, save_diff=True)
+        fast_weights = inner_loop(args, (aux_reals[j], args.aux[j]), model, weights, iters = iters, save_diff=True, progressbar=progressbar)
         all_fast_weights.append(fast_weights)   # save the increamentals
     fast_gradients = model.combine_fast_weights(all_fast_weights, type='meta')
 
@@ -471,9 +484,10 @@ while True:
     meta_opt.step()
 
     info = 'Outer-loop (all): lr={:.8f}, loss (fake) ={}'.format(meta_opt.param_groups[0]['lr'], export(loss_outer))
-    args.logger.info(info)
+    # progressbar.set_description(info)
+
     if args.tensorboard and (not args.debug):
-        writer.add_scalar('train/Loss', export(loss_outer), iters + k)
+        writer.add_scalar('train/Loss', export(loss_outer), iters)
     
     # -- zero-out self-embeddings
     model.encoder.out.weight.data[4:, :].zero_()   # ignore the first special tokens.
