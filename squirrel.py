@@ -62,8 +62,8 @@ parser.add_argument('--seed',    type=int, default=19920206, help='seed for rand
 parser.add_argument('--universal', action='store_true', help='enable embedding sharing in the universal space')
 parser.add_argument('--inter_size', type=int, default=1, help='hack: inorder to increase the batch-size.')
 parser.add_argument('--share_universal_embedding', action='store_true', help='share the embedding matrix with target. Currently only supports English.')
-parser.add_argument('--finetune_dataset',  type=str, default=None)
 parser.add_argument('--finetune', action='store_true', help='add an action as finetuning. used for RO dataset.')
+parser.add_argument('--finetune_dataset',  type=str, default=None)
 parser.add_argument('--universal_options', default='all', const='all', nargs='?',
                     choices=['no_use_universal', 'no_update_universal', 'no_update_self', 'no_update_encdec', 'all'], help='list servers, storage, or both (default: %(default)s)')
 parser.add_argument('--meta_learning', action='store_true', help='meta-learning for low resource neural machine translation')
@@ -294,14 +294,8 @@ logger.info(arg_str)
 # ----------------------------------------------------------------------------------------------------------------- #
 
 # optimizer
-if args.no_meta_training:
-    meta_opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
-else:  # meta-model only updates meta-parameters
-    meta_opt = torch.optim.Adam([p for p in model.get_parameters(type='meta') if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
-
-# for p in meta_opt.param_groups[0]['params']:
-#     print(p.size())
-# 1/0
+meta_opt = torch.optim.Adam([p for p in model.get_parameters(type='meta') if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
+    
  # if resume training
 if (args.load_from is not None) and (args.resume):
     with torch.cuda.device(args.gpu):   # very important.
@@ -328,10 +322,14 @@ def inner_loop(args, data, model, weights, iters=0, save_diff=True, self_opt=Non
     data_loader, data_name = data
     progressbar = tqdm(total=args.inner_steps, desc='start training for {}'.format(data_name))
 
-    
     model.load_fast_weights(weights)
+    with torch.cuda.device(args.gpu):
+        slow_weights = copy.deepcopy(model.save_fast_weights(type='slow'))  # --- universal embeddings are not updated, but accumurated.
+    diff_slow_weights = None
+
     if self_opt is None:
-        self_opt = torch.optim.Adam([p for p in model.get_parameters(type='fast') if p.requires_grad], betas=(0.9, 0.98), eps=1e-9) # reset the optimizer
+        self_opt = torch.optim.Adam([p for p in model.get_parameters(type='full') if p.requires_grad], 
+                                    betas=(0.9, 0.98), eps=1e-9) # reset the optimizer
     
     for i in range(args.inner_steps):                                                                                                
         self_opt.param_groups[0]['lr'] = get_learning_rate(iters + i + 1, disable=args.disable_lr_schedule)
@@ -353,10 +351,20 @@ def inner_loop(args, data, model, weights, iters=0, save_diff=True, self_opt=Non
         progressbar.update(1)
         progressbar.set_description(info)
 
-    progressbar.close()
+        # accumulate difference
+        if diff_slow_weights is None:
+            diff_slow_weights = model.save_fast_weights(weights=slow_weights, type='slow')
+        else:
+            diff_slow_weights = model.combine_fast_weights([diff_slow_weights, model.save_fast_weights(weights=slow_weights, type='slow')], type='slow', average=False)
 
+        # slow weights remain normal
+        model.load_fast_weights(slow_weights, type='slow')
+
+    progressbar.close()
     if save_diff:
-        return model.save_fast_weights(weights=weights)  # fast-weights
+        diff_weights = model.save_fast_weights(weights=weights)
+        diff_weights.update(diff_slow_weights)
+        return diff_weights
     return model.save_fast_weights()
 
 
@@ -382,7 +390,7 @@ while True:
             outs = copy.deepcopy(model.encoder.out.state_dict())
 
         fast_weights = weights
-        self_opt = torch.optim.Adam([p for p in model.get_parameters(type='fast') if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
+        self_opt = torch.optim.Adam([p for p in model.get_parameters(type='full') if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
         corpus_bleu = -1
         corpus_gleu = -1
 
@@ -401,7 +409,7 @@ while True:
             fast_weights = inner_loop(args, (train_real, "ro"), model, fast_weights, dev_iters, save_diff=False, self_opt=self_opt)
             outputs_data = valid_model(args, model, dev_real, dev_metrics, print_out=True)
             dev_iters += args.inner_steps
-
+            
             if args.tensorboard and (not args.debug):
                 writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, dev_iters)
                 writer.add_scalar('dev/Loss', dev_metrics.loss, dev_iters)
@@ -421,15 +429,14 @@ while True:
             writer.add_scalar('dev/zero_shot_BLEU', corpus_bleu0, iters)
             writer.add_scalar('dev/fine_tune_BLEU', corpus_bleu, iters)
 
-        
-        args.logger.info('validation done.\n')
-        model.load_fast_weights(weights)         # --- comming back to normal
-        model.encoder.out.load_state_dict(outs)  # --- comming back to normal
-
         if not args.debug:
             best.accumulate(corpus_bleu, corpus_gleu, iters)
             args.logger.info('the best model is achieved at {}, corpus GLEU={}, corpus BLEU={}'.format(
                 best.i, best.corpus_gleu, best.corpus_bleu))
+
+        args.logger.info('validation done.\n')
+        model.load_fast_weights(weights)         # --- comming back to normal
+        model.encoder.out.load_state_dict(outs)  # --- comming back to normal
 
     # ----- meta-training ------- #
     model.train()
@@ -441,76 +448,37 @@ while True:
     selected = random.randint(0, args.n_lang - 1)
     languages = range(args.n_lang) if not args.sequential_learning else [selected]
 
-    if not args.no_meta_training:  # ----- only meta-learning requires inner-loop
-        with torch.cuda.device(args.gpu):
-            weights = copy.deepcopy(model.save_fast_weights())  # in case the data has been changed...
-        
-        all_fast_weights = []
-        for j in languages:
-            fast_weights = inner_loop(args, (aux_reals[j], args.aux[j]), model, weights, iters = iters, save_diff=True)
-            all_fast_weights.append(fast_weights)   # save the increamentals
+    with torch.cuda.device(args.gpu):
+        weights = copy.deepcopy(model.save_fast_weights())  # in case the data has been changed...
     
-    # ------ outer-loop -----
-    progressbar = tqdm(total=args.outer_steps, desc='start training')
+    all_fast_weights = []
+    for j in languages:
+        fast_weights = inner_loop(args, (aux_reals[j], args.aux[j]), model, weights, iters = iters, save_diff=True)
+        all_fast_weights.append(fast_weights)   # save the increamentals
+    fast_gradients = model.combine_fast_weights(all_fast_weights, type='meta')
+
+    # ------ outer-upate for reptile (parallel mode or sequential mode.)
+    meta_opt.param_groups[0]['lr'] = get_learning_rate(iters + 1, disable=args.disable_lr_schedule)
+    meta_opt.zero_grad()
     
-    for k in range(args.outer_steps):
-        meta_opt.param_groups[0]['lr'] = get_learning_rate(iters + k + 1, disable=args.disable_lr_schedule)
-        meta_opt.zero_grad()
-        
-        loss_outer = 0
-        bs_outter = 0
+    # -- virtual batch, only used to build the backward pass
+    inputs, input_masks, targets, target_masks, sources, source_masks, encoding, batch_size = model.quick_prepare(next(iter(aux_reals[selected])))
+    loss_outer = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks))
+    loss_outer.backward()
 
-        if args.no_meta_training:
-            assert not args.sequential_learning, "normal training used multiple languages"
+    # -- load fast gradient...
+    model.load_fast_gradients(fast_gradients, type='meta')
+    meta_opt.step()
 
-        if not args.sequential_learning:
-            for j in range(args.n_lang):
-                meta_train_batch = next(iter(aux_reals[j]))
-                if not args.no_meta_training:
-                    model.load_fast_weights(all_fast_weights[j], weights)
-                inputs, input_masks, targets, target_masks, sources, source_masks, encoding, batch_size = model.quick_prepare(meta_train_batch)
-                loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.n_lang
-                loss.backward()   
-                loss_outer = loss_outer + loss
-                bs_outter = bs_outter + batch_size * max(inputs.size(1), targets.size(1))
-
-        else:   # sequential training, only use one language.
-            model.load_fast_weights(all_fast_weights[0], weights)
-            for j in range(args.inter_size):
-                meta_train_batch = next(iter(aux_reals[selected]))
-                inputs, input_masks, targets, target_masks, sources, source_masks, encoding, batch_size = model.quick_prepare(meta_train_batch)
-                loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks)) / args.inter_size
-                loss.backward()   
-                loss_outer = loss_outer + loss
-                bs_outter = bs_outter + batch_size * max(inputs.size(1), targets.size(1))
-
-        # update the meta-parameters
-        if not args.no_meta_training:
-            model.load_fast_weights(weights)
-            meta_opt.step()
-            
-            with torch.cuda.device(args.gpu):
-                weights = copy.deepcopy(model.save_fast_weights())
-
-        else:
-            meta_opt.step()
-
-        info = 'Outer-loop (all): loss={:.3f}, lr={:.8f}, batch_size={}'.format(export(loss_outer), meta_opt.param_groups[0]['lr'], bs_outter)
-        tokens = tokens + bs_outter
-
-        if args.tensorboard and (not args.debug):
-            writer.add_scalar('train/Loss', export(loss_outer), iters + k)
-        
-        progressbar.update(1)
-        progressbar.set_description(info)
+    info = 'Outer-loop (all): lr={:.8f}, loss (fake) ={}'.format(meta_opt.param_groups[0]['lr'], export(loss_outer))
+    args.logger.info(info)
+    if args.tensorboard and (not args.debug):
+        writer.add_scalar('train/Loss', export(loss_outer), iters + k)
     
-    progressbar.close()
+    # -- zero-out self-embeddings
+    model.encoder.out.weight.data[4:, :].zero_()   # ignore the first special tokens.
 
-    # ---- zero the self-embedding matrix
-    if not args.no_meta_training:
-        model.encoder.out.weight.data[4:, :].zero_() # ignore the first special tokens.
-
-    iters = iters + args.outer_steps
+    iters = iters + 1
     eposides = eposides + 1
 
     def hms(sec_elapsed):
@@ -518,6 +486,6 @@ while True:
         m = int((sec_elapsed % (60 * 60)) / 60)
         s = sec_elapsed % 60.
         return "{}:{:>02}:{:>05.2f}".format(h, m, s)
-    args.logger.info("Training {} tokens / {} batches / {} episodes, ends with: {}\n".format(tokens, iters, eposides, hms(time.time() - time0)))
+    args.logger.info("Training {} batches / {} episodes, ends with: {}\n".format(iters, eposides, hms(time.time() - time0)))
 
 args.logger.info('Done.')

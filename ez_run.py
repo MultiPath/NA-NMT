@@ -127,7 +127,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-fh = logging.FileHandler('./logs/log-{}.txt'.format(args.prefix))
+fh = logging.FileHandler('{}/log-{}.txt'.format(args.logs_dir, args.prefix))
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(formatter)
 ch = logging.StreamHandler()
@@ -339,7 +339,7 @@ logger.info(arg_str)
 
 if args.tensorboard and (not args.debug):
     from tensorboardX import SummaryWriter
-    writer = SummaryWriter('{}/{}'.format(args.runs_prefix, args.prefix + args.hp_str))
+    writer = SummaryWriter('{}/{}'.format(args.runs_dir, args.prefix + args.hp_str))
 
 # ----------------------------------------------------------------------------------------------------------------- #
 if args.mode == 'train':

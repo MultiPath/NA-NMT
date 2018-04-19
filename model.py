@@ -5,6 +5,7 @@ from torch.autograd import Variable, Function
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 import math
+
 from collections import OrderedDict
 from utils import computeGLEU, masked_sort, unsorted
 
@@ -1032,43 +1033,80 @@ class UniversalTransformer(Transformer):
             assert args.universal, "only works for universal neural machine translation"
             self.encoder.uni_out.weight = self.decoder.out.weight
 
-    def get_parameters(self, meta=False):
-        params = []
-        if meta:
-            for module in [self.encoder.layers, self.encoder.uni_out, self.encoder.A, self.decoder]:
-                params += list(module.parameters())
+    def get_parameters(self, type='meta', named=False):
+        if not named:
+            params = []
+            if type == 'meta':
+                for module in [self.encoder.layers, self.encoder.uni_out, self.encoder.A, self.decoder]:
+                    params += list(module.parameters())
+            elif type == 'fast':
+                for module in [self.encoder.layers, self.encoder.out, self.decoder]:
+                    params += list(module.parameters())
+            elif type == 'full':
+                params = list(self.parameters())
+
+            else:
+                raise NotImplementedError
         else:
-            for module in [self.encoder.layers, self.encoder.out, self.decoder]:
-                params += list(module.parameters())
+            params = OrderedDict()
+            
+            if type == 'meta':
+                prefixs = ['encoder.layers', 'encoder.uni_out', 'encoder.A', 'decoder']
+                modules = [self.encoder.layers, self.encoder.uni_out, self.encoder.A, self.decoder]
+                
+            elif type == 'fast':
+                prefixs = ['encoder.layers', 'decoder']
+                modules = [self.encoder.layers, self.decoder]
+            
+            elif type == 'slow':
+                prefixs = ['encoder.uni_out', 'encoder.A']
+                modules = [self.encoder.uni_out, self.encoder.A]
+            
+            else:
+                raise NotImplementedError
+
+            for prefix, module in zip(prefixs, modules):
+                for name, param in module.named_parameters(prefix=prefix):
+                    params[name] = param
+
         return params
         
-    def save_fast_weights(self, weights=None):
-        fast_weights = [OrderedDict(), OrderedDict()]
-        for name, param in self.encoder.layers.named_parameters():
-            if weights is not None:
-                fast_weights[0][name] = param.data - weights[0][name]  # save the delta of parameters
-            else:
-                fast_weights[0][name] = param.data
 
-        for name, param in self.decoder.named_parameters():
+    def save_fast_weights(self, weights=None, type='fast'):
+        fast_weights = OrderedDict()
+        model_fast_weights = self.get_parameters(type, True)
+        for name in model_fast_weights:
             if weights is not None:
-                fast_weights[1][name] = param.data - weights[1][name]  # save the delta of parameters
+                fast_weights[name] = model_fast_weights[name].data - weights[name]  # save the delta of parameters
             else:
-                fast_weights[1][name] = param.data
+                fast_weights[name] = model_fast_weights[name].data
         return fast_weights
 
-    def load_fast_weights(self, fast_weights, weights=None):
-        for name, param in self.encoder.layers.named_parameters():
+    def load_fast_weights(self, fast_weights, weights=None, type='fast'):
+        model_fast_weights = self.get_parameters(type, True)
+        for name in model_fast_weights:
             if weights is not None:
-                param.data.copy_(fast_weights[0][name] + weights[0][name])
+                model_fast_weights[name].data.copy_(fast_weights[name] + weights[name])
             else:
-                param.data.copy_(fast_weights[0][name])
+                model_fast_weights[name].data.copy_(fast_weights[name])
 
-        for name, param in self.decoder.named_parameters():
-            if weights is not None:
-                param.data.copy_(fast_weights[1][name] + weights[1][name])
-            else:
-                param.data.copy_(fast_weights[1][name])
+    def load_fast_gradients(self, fast_gradients, type='fast', ep=0.1):
+        model_fast_weights = self.get_parameters(type, True)
+        for name in model_fast_weights:
+            model_fast_weights[name].grad.data.copy_(-fast_gradients[name] * ep)
+
+    def combine_fast_weights(self, all_fast_weights, type='fast', average=True):
+        if len(all_fast_weights) == 1:
+            return all_fast_weights[0]
+
+        fast_weights = OrderedDict()
+        model_fast_weights = self.get_parameters(type, True)
+        for name in model_fast_weights:
+            fast_weights[name] = sum([weights[name] for weights in all_fast_weights]) 
+            if average:
+                fast_weights[name] = fast_weights[name] / len(all_fast_weights) 
+        return fast_weights
+        
 
 class FastTransformer(Transformer):
 
