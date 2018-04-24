@@ -103,13 +103,8 @@ def demask(inputs, the_mask):
 # F.softmax has strange default behavior, normalizing over dim 0 for 3D inputs
 def softmax(x):
     return F.softmax(x, dim=-1)
-    # if x.dim() == 3:
-    #     return F.softmax(x.transpose(0, 2)).transpose(0, 2)
-    # return F.softmax(x)
 
 def log_softmax(x):
-    # if x.dim() == 3:
-    #     return F.log_softmax(x.transpose(0, 2)).transpose(0, 2)
     return F.log_softmax(x, dim=-1)
 
 def logsumexp(x, dim=-1):
@@ -120,6 +115,14 @@ def gumbel_softmax(input, beta=0.5, tau=1.0):
     noise = input.data.new(*input.size()).uniform_()
     noise.add_(TINY).log_().neg_().add_(TINY).log_().neg_()
     return softmax((input + beta * Variable(noise)) / tau)
+
+def argmax(x):  # return the one-hot vectors
+    shape = x.size()
+    _, ind = x.max(dim=-1)
+    x_hard = x.data.new(x.size()).zero_().view(-1, shape[-1])
+    x_hard.scatter_(1, ind.view(-1, 1), 1)
+    x_hard = x_hard.view(*shape)
+    return Variable(x_hard)
 
 # torch.matmul can't do (4, 3, 2) @ (4, 2) -> (4, 3)
 def matmul(x, y):
@@ -557,27 +560,26 @@ class Encoder(nn.Module):
         self.universal = args.universal
         self.universal_options = args.universal_options
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, argmax=False):
 
         if self.universal:
             alpha = F.embedding(x, self.Freq[:, None])
             u = F.embedding(x, self.U) @ self.A.weight @ (self.V.transpose(1, 0)) # batch-size x L x 300
-            p = F.softmax(u / 0.05, dim=-1) # temperature = 0.05
+            if self.universal_options == 'argmax:                
+                u = F.softmax(u, dim=-1)
+                p = (argmax(u) - u).detach() + u  # straight-through
+              
+            else:
+                u = F.embedding(x, self.U) @ self.A.weight @ (self.V.transpose(1, 0)) # batch-size x L x 300
+                p = F.softmax(u / 0.05, dim=-1) # temperature = 0.05 (hack)
+            
             v = p @ self.uni_out.weight * math.sqrt(self.d_model)
+
         else:
             alpha = 0
             v = 0
 
-        if self.universal_options == 'no_use_universal':
-            alpha = alpha * 0  # directly disabled the universal tokens.
-        if self.universal_options == 'no_update_universal':
-            v = v.detach()
-
         x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
-        if self.universal_options == 'no_update_self':
-            x = x.detach()
-            v = v.detach()
-
         x = x + alpha * v  # two embeddings together
         x = x + positional_encodings_like(x)
         encoding = [x]
@@ -1090,7 +1092,7 @@ class UniversalTransformer(Transformer):
             else:
                 model_fast_weights[name].data.copy_(fast_weights[name])
 
-    def load_fast_gradients(self, fast_gradients, type='fast', ep=0.1):
+    def load_fast_gradients(self, fast_gradients, type='fast', ep=0.01):
         model_fast_weights = self.get_parameters(type, True)
         for name in model_fast_weights:
             model_fast_weights[name].grad.data.copy_(-fast_gradients[name] * ep)
