@@ -65,8 +65,8 @@ parser.add_argument('--inter_size', type=int, default=1, help='hack: inorder to 
 parser.add_argument('--share_universal_embedding', action='store_true', help='share the embedding matrix with target. Currently only supports English.')
 parser.add_argument('--finetune_dataset',  type=str, default=None)
 parser.add_argument('--finetune', action='store_true', help='add an action as finetuning. used for RO dataset.')
-parser.add_argument('--universal_options', default='all', const='all', nargs='?',
-                    choices=['argmax', 'all'], help='list servers, storage, or both (default: %(default)s)')
+parser.add_argument('--universal_options', default=[], nargs='*', 
+                    choices=['argmax', 'st', 'fixed_A', 'trainable_universal_tokens'], help='list servers, storage, or both (default: %(default)s)')
 parser.add_argument('--meta_learning', action='store_true', help='meta-learning for low resource neural machine translation')
 
 # meta-learning 
@@ -300,9 +300,6 @@ if args.no_meta_training:
 else:  # meta-model only updates meta-parameters
     meta_opt = torch.optim.Adam([p for p in model.get_parameters(type='meta') if p.requires_grad], betas=(0.9, 0.98), eps=1e-9)
 
-# for p in meta_opt.param_groups[0]['params']:
-#     print(p.size())
-# 1/0
  # if resume training
 if (args.load_from is not None) and (args.resume):
     with torch.cuda.device(args.gpu):   # very important.

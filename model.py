@@ -119,10 +119,10 @@ def gumbel_softmax(input, beta=0.5, tau=1.0):
 def argmax(x):  # return the one-hot vectors
     shape = x.size()
     _, ind = x.max(dim=-1)
-    x_hard = x.data.new(x.size()).zero_().view(-1, shape[-1])
+    x_hard = Variable(x.data.new(x.size()).zero_().view(-1, shape[-1]))
     x_hard.scatter_(1, ind.view(-1, 1), 1)
     x_hard = x_hard.view(*shape)
-    return Variable(x_hard)
+    return x_hard
 
 # torch.matmul can't do (4, 3, 2) @ (4, 2) -> (4, 3)
 def matmul(x, y):
@@ -543,12 +543,26 @@ class Encoder(nn.Module):
         if args.universal:
             self.out.weight.data[4:, :].zero_()  # zero all non-special token-embeddings (they are bias)
             self.uni_out = nn.Linear(args.d_model, args.V.size(0), bias=False)
+            
+            # additional transformation for A
             self.A = nn.Linear(args.U.size(1), args.U.size(1), bias=False)
             nn.init.eye(self.A.weight)
 
-            # not trainable
+            if "fixed_A" in args.universal_options:
+                self.A.weight.requires_grad = False
+
+            # not trainable --- (?)
             self.U = Variable(args.U)  # data
-            self.V = Variable(args.V)  # data
+
+            if "trainable_universal_tokens" in args.universal_options:
+                self.universal_token_keys = nn.Linear(args.V.size(1), args.V.size(0), bias=False)
+                
+                with torch.cuda.device(args.gpu):
+                    self.universal_token_keys.weight.data.copy_(args.V)  
+                self.V = self.universal_token_keys.weight # reference ? 
+            else:
+                self.V = Variable(args.V)  # not trainable.
+            
             self.Freq = Variable(args.Freq)
 
         self.layers = nn.ModuleList(
@@ -560,17 +574,20 @@ class Encoder(nn.Module):
         self.universal = args.universal
         self.universal_options = args.universal_options
 
-    def forward(self, x, mask=None, argmax=False):
+    def forward(self, x, mask=None):
 
         if self.universal:
             alpha = F.embedding(x, self.Freq[:, None])
             u = F.embedding(x, self.U) @ self.A.weight @ (self.V.transpose(1, 0)) # batch-size x L x 300
-            if self.universal_options == 'argmax:                
-                u = F.softmax(u, dim=-1)
-                p = (argmax(u) - u).detach() + u  # straight-through
-              
+            if "argmax" in self.universal_options:  
+
+                if "st" in self.universal_options: 
+                    p = F.softmax(u / 0.05, dim=-1)
+                    p = (argmax(p) - p).detach() + p  # straight-through
+                else:
+                    p = argmax(u)
+
             else:
-                u = F.embedding(x, self.U) @ self.A.weight @ (self.V.transpose(1, 0)) # batch-size x L x 300
                 p = F.softmax(u / 0.05, dim=-1) # temperature = 0.05 (hack)
             
             v = p @ self.uni_out.weight * math.sqrt(self.d_model)
@@ -1028,6 +1045,7 @@ class UniversalTransformer(Transformer):
         self.decoder = Decoder(trg, args)
         self.field = trg
         self.share_embeddings = args.share_embeddings
+        self.universal_options = args.universal_options
         if args.share_embeddings:
             self.encoder.out.weight = self.decoder.out.weight
 
@@ -1039,11 +1057,17 @@ class UniversalTransformer(Transformer):
         if not named:
             params = []
             if type == 'meta':
-                for module in [self.encoder.layers, self.encoder.uni_out, self.encoder.A, self.decoder]:
+                modules = [self.encoder.layers, self.encoder.uni_out, self.encoder.A, self.decoder]
+                if "trainable_universal_tokens" in self.universal_options:
+                    modules += [self.encoder.universal_token_keys]
+
+                for module in modules:
                     params += list(module.parameters())
+
             elif type == 'fast':
-                for module in [self.encoder.layers, self.encoder.out, self.decoder]:
+                for module in [self.encoder.layers, self.encoder.out, self.encoder.A, self.decoder]:
                     params += list(module.parameters())
+
             elif type == 'full':
                 params = list(self.parameters())
 
@@ -1056,14 +1080,20 @@ class UniversalTransformer(Transformer):
                 prefixs = ['encoder.layers', 'encoder.uni_out', 'encoder.A', 'decoder']
                 modules = [self.encoder.layers, self.encoder.uni_out, self.encoder.A, self.decoder]
                 
+                if "trainable_universal_tokens" in self.universal_options:
+                    prefixs += ['encoder.universal_token_keys']
+                    modules += [self.encoder.universal_token_keys]
+
             elif type == 'fast':
-                prefixs = ['encoder.layers', 'decoder']
-                modules = [self.encoder.layers, self.decoder]
+                # prefixs = ['encoder.layers', 'decoder']
+                prefixs = ['encoder.layers', 'decoder', 'encoder.A']
+                modules = [self.encoder.layers, self.decoder, self.encoder.A]
             
             elif type == 'slow':
                 prefixs = ['encoder.uni_out', 'encoder.A']
                 modules = [self.encoder.uni_out, self.encoder.A]
-            
+
+
             else:
                 raise NotImplementedError
 

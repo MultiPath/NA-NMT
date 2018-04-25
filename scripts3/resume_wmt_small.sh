@@ -18,10 +18,8 @@ python meta_nmt.py \
                 -s ro -t en -a es pt it fr \
                 --universal \
                 --sequential_learning \
-                --universal_options "trainable_universal_tokens" \
-
-                # --debug \
-
+                --debug \
+                --universal_options "fixed_A" \
                 # --debug \
                 # --universal_options "argmax" \
                 #--debug
